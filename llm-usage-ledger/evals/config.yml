@@ -1,0 +1,38 @@
+schema_version: 1
+
+harbor:
+  task_source: evals_json
+  # Set explicitly: the docs and the code disagree about the default.
+  base_image_mode: disabled
+  # An accounting tool that gets the number right two runs in three is not
+  # shippable, and n_attempts: 1 cannot show that. Keep every attempt so the
+  # rate is honest.
+  n_attempts: 3
+  pass_threshold: 0.5
+  stop_on_pass: false
+  n_concurrent: 2
+  # Two cases build git repositories and run an importer over transcripts.
+  timeout_multiplier: 1.5
+  agent_runtime_preflight: true
+  # BOTH arms need git, or lul-two-clones-one-repo fails for an environment
+  # reason rather than a skill reason and the lift measurement is worthless.
+  # Assumes a Debian-family base image with apt and network access at setup
+  # time; the guard makes it a no-op where git is already present.
+  pre_agent_setup:
+    - command -v git >/dev/null 2>&1 || (apt-get update -qq && apt-get install -y --no-install-recommends git)
+  # Everything else is stdlib Python 3 -- the skill takes no pip dependencies,
+  # so there is deliberately nothing to install for the with-skill arm that
+  # the without-skill arm does not also have.
+  resources:
+    cpus: 2
+    memory_mb: 4096
+
+skill_workspace:
+  mode: isolated
+  include: []
+
+grading:
+  # Standard grading (five dimensions + Skill Lift) PLUS grader.py, which owns
+  # the thing no judge should be asked to eyeball: whether the dollar figure
+  # and the record counts are actually right.
+  mode: default_plus_custom

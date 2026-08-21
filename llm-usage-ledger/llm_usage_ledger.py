@@ -30,6 +30,7 @@ CLI:
 import argparse
 import datetime
 import getpass
+import hashlib
 import json
 import os
 import platform
@@ -44,6 +45,23 @@ from pathlib import Path
 
 SCHEMA_VERSION = 1
 _write_lock = threading.Lock()
+
+# Sentinel for "this record's writer did not record who/where". It is a VALUE,
+# never a guess: reading someone else's file must never mint an identity for
+# it. See _normalize() — defaulting to the reader's own name credited 22,229
+# foreign rows to whoever happened to open the dashboard.
+UNATTRIBUTED = "unattributed"
+
+# Prefix for a working directory with no git remote. Deliberately NOT a
+# filesystem path: a path leaks the local username into a shared ledger and
+# still joins with nobody. The 12-hex suffix keeps two scratch dirs on one
+# machine distinguishable without being readable.
+NO_REMOTE = "no-remote"
+
+# Files that live in the ledger dir but are NOT usage events. Excluded by
+# NAME, not by sniffing fields — a heuristic would silently start or stop
+# dropping rows as the schema evolves.
+NON_USAGE_FILES = frozenset({"prices.jsonl"})
 
 # Reference cloud rates for savings estimates ($/1M tokens). Versioned +
 # dated so historical reports stay reproducible: add entries, never edit.
@@ -74,24 +92,72 @@ def machine_name() -> str:
             or platform.node().split(".")[0] or "unknown")
 
 
+def canonical_repo_key(url: str) -> str:
+    """Any remote spelling -> 'host/org/name'. Returns "" for empty input.
+
+    The same repository is cloned as `git@github.com:Org/Repo.git` by one
+    developer and `https://github.com/org/repo` by the next. Lower-casing and
+    stripping `.git` (what this used to do) leaves those as two DIFFERENT
+    strings, so the cross-developer join splits in half without any error —
+    the worst kind of failure, because both halves look like valid totals.
+    Canonicalising to host/org/name collapses them onto one key.
+
+    Handled: scp-style (`git@host:org/repo`), any scheme://, embedded
+    credentials (`https://user:token@host/...`), a non-default port, a
+    trailing `.git` or `/`, and case.
+    """
+    u = (url or "").strip()
+    if not u:
+        return ""
+    u = re.sub(r"\.git/*$", "", u).rstrip("/")
+    m = re.match(r"^([A-Za-z][A-Za-z0-9+.\-]*)://(.*)$", u)
+    if m:                                    # scheme://[user[:pw]@]host[:port]/path
+        scheme, rest = m.group(1).lower(), m.group(2)
+        head, sep, tail = rest.partition("/")
+        if "@" in head:                      # drop embedded credentials
+            head = head.rsplit("@", 1)[-1]
+        if scheme == "file" or not head:     # file:///srv/git/repo
+            host, path = "local", rest
+        else:
+            host, path = head.split(":")[0], tail
+    elif re.match(r"^(?:[^/@]+@)?[^/:]+:", u):   # git@github.com:org/repo
+        hostpart, _, path = u.partition(":")
+        host = hostpart.rsplit("@", 1)[-1]
+    else:                                    # bare path remote (/srv/git/repo)
+        host, path = "local", u
+    return f"{host.strip('/')}/{path.strip('/')}".strip("/").lower()
+
+
+def unjoinable_repo_key(cwd: str = ".") -> str:
+    """Explicit marker for 'this directory has no remote, so nothing can ever
+    join to it'. The old fallback was "path:" + the absolute path, which put
+    /home/USER/... into every shared record — an identity leak that
+    bought nothing, since a local path joins across developers exactly never.
+    A digest of the path keeps two scratch dirs apart without naming anyone."""
+    h = hashlib.sha256(str(Path(cwd).resolve()).encode("utf-8")).hexdigest()
+    return f"{NO_REMOTE}:{h[:12]}"
+
+
 def repo_remote_key(cwd: str = ".") -> str:
     """Identity that is the SAME for every developer on a repo.
 
     detect_project() returns the local folder name, so two people who clone the
     same repo into differently-named directories log different projects and
-    their spend never adds up. The git remote URL is identical on every clone on
-    every machine, so it is the join key. Falls back to a path for scratch dirs
-    with no remote.
+    their spend never adds up. The canonicalised git remote is identical on
+    every clone on every machine, so it is the join key. With no remote you get
+    an explicit unjoinable marker, never a path.
     """
     try:
         r = subprocess.run(["git", "-C", cwd, "remote", "get-url", "origin"],
                            capture_output=True, text=True, timeout=5)
         url = (r.stdout or "").strip()
         if r.returncode == 0 and url:
-            return re.sub(r"\.git$", "", url.lower())
+            key = canonical_repo_key(url)
+            if key:
+                return key
     except (OSError, subprocess.SubprocessError):
         pass
-    return "path:" + str(Path(cwd).resolve())
+    return unjoinable_repo_key(cwd)
 
 
 def project_registry() -> dict:
@@ -104,11 +170,25 @@ def project_registry() -> dict:
         return {}
 
 
+def registry_lookup(key: str) -> dict:
+    """Registry record for a canonical repo key, tolerating the RAW remote-url
+    keys agent-coach has already written (`git@github.com:org/repo`). Without
+    this, canonicalising the key would silently orphan every d1 tag anyone has
+    set so far — a fix that quietly deletes data is not a fix."""
+    reg = project_registry()
+    if key in reg:
+        return reg[key] or {}
+    for k, v in reg.items():
+        if canonical_repo_key(str(k)) == key:
+            return v or {}
+    return {}
+
+
 def project_tag(cwd: str = ".") -> dict:
     """(project, d1, repo) for cwd. `d1` is the institutional code when the repo
     has been registered; None for a POC or an untagged repo — never invented."""
     key = repo_remote_key(cwd)
-    rec = project_registry().get(key) or {}
+    rec = registry_lookup(key)
     return {"repo": key,
             "project": rec.get("project") or detect_project(cwd),
             "d1": rec.get("d1")}
@@ -182,14 +262,24 @@ def _normalize(e: dict) -> dict:
         return {"schema": e.get("schema"), "ts": e.get("ts", ""),
                 "duration_s": e.get("duration_s"),
                 "provider": e.get("provider", "?"),
-                "machine": e.get("machine", machine_name()),
-                "user": e.get("user", whoami()),
+                # NEVER whoami()/machine_name() here. This function reads
+                # OTHER people's files; inferring identity from the reader
+                # credited every foreign row to whoever ran the report.
+                "machine": e.get("machine") or UNATTRIBUTED,
+                "user": e.get("user") or UNATTRIBUTED,
                 "project": e.get("project", "?"), "model": e.get("model", "?"),
                 "prompt_tokens": e.get("tokens_in") or 0,
                 "completion_tokens": e.get("tokens_out") or 0,
                 "reasoning_tokens": e.get("reasoning_tokens"),
-                "task_tag": e.get("task_tag")}
-    return e
+                "task_tag": e.get("task_tag"),
+                # pass through only when the foreign writer actually set them —
+                # an absent join key must stay absent, not become ""
+                **{k: e[k] for k in ("repo", "d1") if e.get(k)}}
+    # Same rule for the skill's own schema: a row that never recorded who or
+    # where gets the sentinel, not the reader and not a bare "?" that reads
+    # like a parse failure. Read-time only — nothing on disk is rewritten.
+    fill = {k: UNATTRIBUTED for k in ("user", "machine") if not e.get(k)}
+    return {**e, **fill} if fill else e
 
 
 def is_local_event(e: dict) -> bool:
@@ -209,6 +299,12 @@ def read_ledgers(days: float = None, scope: str = "skill"):
                   - datetime.timedelta(days=days))
     pattern = "*.jsonl" if scope == "all" else "lmstudio-*.jsonl"
     for path in sorted(ledger_dir().glob(pattern)):
+        # prices.jsonl is a dated PRICE series that happens to share the
+        # directory and the extension. Swept in by the glob, its rows parse
+        # cleanly, carry a `ts`, and count as zero-token calls — inflating the
+        # call count and inventing an identity-less phantom row per price.
+        if path.name in NON_USAGE_FILES:
+            continue
         for line in path.read_text().splitlines():
             if not line.strip():
                 continue
@@ -450,25 +546,76 @@ def as_of_price(model: str, ts: str, series: dict):
 # ingested survives the tool's own transcript pruning. Records carry
 # subscription=true: reports price them at API rates as "what the plan
 # absorbed", never mixed into local savings or cloud spend.
-INGEST_CONTACT = "sage.arbor@duke.edu"
+def ingest_contact() -> str:
+    """Where an importer bug gets reported. Env-overridable, and the default
+    names a ROLE, not a person: a personal address compiled into a skill that
+    other organisations install routes their bug reports to one individual
+    forever, including after that person changes jobs."""
+    return os.environ.get("LLM_LEDGER_SUPPORT_CONTACT") or (
+        "your llm-usage-ledger maintainer (set LLM_LEDGER_SUPPORT_CONTACT "
+        "to route these reports)")
 
 
 def _ingest_derived_file(tool: str) -> Path:
     return ledger_dir() / f"{tool}-{whoami()}-{machine_name()}.jsonl"
 
 
-def _ingest_error(tool: str, n_errors: int, sample: str):
+def line_shape(line: str, exc: BaseException) -> str:
+    """A description of an unparsed line that contains NO part of the line.
+
+    The ledger's whole claim to being installable org-wide is
+    counts-never-content: it records how many tokens, never what was said.
+    Writing 400 raw characters of a transcript into a log — and then asking a
+    colleague to email that log — breaks the invariant in the one code path
+    where nobody is looking. What a maintainer actually needs to fix an
+    importer is the SHAPE: how long, which field, which error, and a digest to
+    tell two distinct failures apart.
+    """
+    digest = hashlib.sha256(line.encode("utf-8", "replace")).hexdigest()[:16]
+    field = "<line-is-not-json>"
+    try:
+        d = json.loads(line)
+    except Exception:
+        d = None
+    if isinstance(d, dict):
+        msg = d.get("message")
+        if not isinstance(msg, dict):
+            field = "message"
+        elif not isinstance(msg.get("usage"), dict):
+            field = "message.usage"
+        elif not d.get("timestamp"):
+            field = "timestamp"
+        else:
+            field = "|".join(sorted(d.keys()))[:120]   # key NAMES only
+    elif d is not None:
+        field = f"<json-{type(d).__name__}>"
+    return (f"err={type(exc).__name__} field={field} len={len(line)} "
+            f"sha256={digest}")
+
+
+def _ingest_error(tool: str, n_errors: int, shape: str):
+    """`shape` MUST come from line_shape() — never a slice of the line."""
     log = ledger_dir() / f"ingest-errors-{tool}.log"
     with open(log, "a") as f:
         f.write(f"{datetime.datetime.now().isoformat(timespec='seconds')} "
-                f"{n_errors} unparsed lines; sample: {sample[:400]}\n")
-    print(f"ingest {tool}: {n_errors} lines not understood — logged to {log}."
-          f"\nPlease email that file to {INGEST_CONTACT} so the importer "
-          f"can be fixed.", file=sys.stderr)
+                f"{n_errors} unparsed lines; first shape: {shape}\n")
+    print(f"ingest {tool}: {n_errors} lines not understood — their SHAPE "
+          f"(length, failing field, digest — never their content) is logged "
+          f"to {log}.\nAttach that log when reporting this to "
+          f"{ingest_contact()} so the importer can be fixed.", file=sys.stderr)
 
 
-def ingest_claude_code():
-    """Derive subscription-usage events from Claude Code transcripts."""
+def ingest_claude_code(refresh: bool = False):
+    """Derive subscription-usage events from Claude Code transcripts.
+
+    refresh=True re-derives records that were already ingested, so fields added
+    to the importer later (notably `repo`, the cross-developer join key) reach
+    rows imported before that field existed. It is OPT-IN — `ingest claude-code
+    --refresh` — because it rewrites existing ledger rows, and a tool that
+    silently rewrites your accounting history is not one you can audit. The
+    default path still skips anything already seen, so a plain re-ingest can
+    never duplicate or mutate.
+    """
     src = Path.home() / ".claude" / "projects"
     if not src.is_dir():
         print("ingest claude-code: no ~/.claude/projects found — nothing to do")
@@ -482,8 +629,11 @@ def ingest_claude_code():
                 existing[e.get("src_id")] = e
             except json.JSONDecodeError:
                 continue
-    n_new = n_err = 0
-    sample_err = ""
+    n_new = n_err = n_refreshed = 0
+    shape_err = ""
+    # one git call per distinct cwd, not per record: 24k records span a few
+    # dozen directories, and `git remote get-url` per row would take minutes
+    tag_cache = {}
     for f in src.glob("*/*.jsonl"):
         for line in f.read_text(errors="replace").splitlines():
             if '"usage"' not in line:
@@ -507,32 +657,55 @@ def ingest_claude_code():
                 if not (tin or tout or cr or w5 or w1h):
                     continue
                 sid = d.get("uuid") or f"{f.name}:{d.get('timestamp')}"
-                if sid in existing:
+                seen = sid in existing
+                if seen and not refresh:
                     continue
                 cwd = d.get("cwd") or ""
-                existing[sid] = {
+                # `project` is the local folder name and differs per developer;
+                # `repo` is the join key SKILL.md documents and was empty on
+                # every row this importer had ever written. `d1` comes from the
+                # shared registry or stays absent — never invented. The cwd
+                # itself is NOT stored: it contains the local username.
+                tag = tag_cache.get(cwd)
+                if tag is None:
+                    tag = (project_tag(cwd) if cwd and Path(cwd).is_dir()
+                           else {"repo": unjoinable_repo_key(cwd) if cwd
+                                 else f"{NO_REMOTE}:unknown-cwd",
+                                 "project": Path(cwd).name if cwd
+                                 else f.parent.name, "d1": None})
+                    tag_cache[cwd] = tag
+                rec = {
                     "schema": SCHEMA_VERSION, "src_id": sid,
                     "ts": (d.get("timestamp") or "").replace("Z", "+00:00"),
                     "provider": "claude-code", "subscription": True,
                     "machine": machine_name(), "user": whoami(),
-                    "project": Path(cwd).name if cwd else f.parent.name,
+                    "project": (Path(cwd).name if cwd else f.parent.name),
+                    "repo": tag["repo"],
                     "model": msg.get("model") or "claude-unknown",
                     "prompt_tokens": tin, "completion_tokens": tout,
                     "cache_read_tokens": cr, "cache_w5_tokens": w5,
                     "cache_w1h_tokens": w1h, "task_tag": "claude-code"}
-                n_new += 1
+                if tag.get("d1"):
+                    rec["d1"] = tag["d1"]
+                existing[sid] = rec
+                if seen:
+                    n_refreshed += 1
+                else:
+                    n_new += 1
             except Exception as e:
                 n_err += 1
-                sample_err = sample_err or f"{e!r}: {line[:200]}"
+                # SHAPE ONLY — see line_shape(). Never `line[:N]`.
+                shape_err = shape_err or line_shape(line, e)
     with _write_lock:
         ledger_dir().mkdir(parents=True, exist_ok=True)
         with open(out, "w") as fh:
             for e in existing.values():
                 fh.write(json.dumps(e) + "\n")
-    print(f"ingest claude-code: {n_new} new events, {len(existing)} total "
-          f"-> {out}")
+    print(f"ingest claude-code: {n_new} new events, "
+          + (f"{n_refreshed} re-derived, " if refresh else "")
+          + f"{len(existing)} total -> {out}")
     if n_err:
-        _ingest_error("claude-code", n_err, sample_err)
+        _ingest_error("claude-code", n_err, shape_err)
 
 
 def ingest_codex():
@@ -543,8 +716,10 @@ def ingest_codex():
         return
     files = list(src.rglob("*.jsonl"))
     print(f"ingest codex: found {len(files)} session file(s) but this "
-          f"importer doesn't know the Codex format yet.\nPlease email one "
-          f"redacted sample file to {INGEST_CONTACT} so it can be added.")
+          f"importer doesn't know the Codex format yet.\nTo get the format "
+          f"added, describe its shape (field names, not values) to "
+          f"{ingest_contact()}. Do not send transcript content: this ledger "
+          f"records counts, never what was said.")
 
 
 # ------------------------------------------------------------- html report
@@ -559,8 +734,9 @@ def _all_usage_events():
     return [{"ts": e["ts"], "local": is_local_event(e),
              "sub": bool(e.get("subscription")),
              "model": e.get("model", "?"), "project": e.get("project", "?"),
-             "machine": e.get("machine", "?"),
-             "user": e.get("user") or "?",
+             "machine": e.get("machine") or UNATTRIBUTED,
+             # a record with no user is its OWN bucket, never someone's row
+             "user": e.get("user") or UNATTRIBUTED,
              "tin": e.get("prompt_tokens") or 0,
              "tout": e.get("completion_tokens") or 0,
              "cr": e.get("cache_read_tokens") or 0,
@@ -638,7 +814,8 @@ summary{cursor:pointer;font-size:.85rem;margin-top:14px}
 </style></head><body>
 <h1>LLM usage ledger report</h1>
 <div class="note">generated @@GENERATED@@ · ledger dir: ~/.llm_token_ledger
- (all *.jsonl writers merged) · @@SPAN@@</div>
+ (all *.jsonl usage writers merged; prices.jsonl is a price series, not usage,
+ and is excluded) · @@SPAN@@@@IDNOTE@@</div>
 <div class="filters">
  <span class="scope" id="clsChips"><button data-c="local">Local</button><button data-c="cloud">Cloud</button><button data-c="sub">Subscription</button></span>
  &nbsp;·&nbsp;
@@ -657,6 +834,10 @@ summary{cursor:pointer;font-size:.85rem;margin-top:14px}
 <div id="modelbars"></div>
 <h2>Tokens by project <span class="note">(within current filters)</span></h2>
 <div id="projbars"></div>
+<h2><span id="userWord">$</span> by person <span class="note">(within current
+ filters; <b>unattributed</b> = records whose writer recorded no user — shown
+ as its own bucket, never credited to a person)</span></h2>
+<div id="userbars"></div>
 <noscript><p class="note">Charts need JavaScript — the data table below is
  complete and static.</p></noscript>
 <details><summary>Data table (all models, unfiltered)</summary>
@@ -675,6 +856,7 @@ catch(e){ document.getElementById("timeline").textContent =
   "report data failed to load: " + e; return; }
 var C = {local:"#2a78d6", cloud:"#008300", sub:"#e87ba4", ink:"#1c2733",
          muted:"#5b6b7b", grid:"#e3e8ee"};
+var UNATTR = "@@UNATTR@@";
 var visible = {local:true, cloud:true, sub:true};
 var machOn = null;   // null until built; map machine -> bool
 var metric = "usd", sel = null;   // sel === null -> all models
@@ -875,7 +1057,18 @@ function render(){
   rs.forEach(function(r){ pt[r.p] = (pt[r.p] || 0) + val(r); });
   bars("projbars", Object.keys(pt).map(function(p){
       return {m:p, v:pt[p]}; }).sort(function(a,b){ return b.v-a.v; }),
-    function(){ return C.ink; }); }
+    function(){ return C.ink; });
+  // Per-person bucket. A row whose writer left `user` empty is bucketed as
+  // UNATTR and drawn in grey -- it is NOT folded into whoever opened this
+  // report, which is what the old reader-identity default did to 22k rows.
+  document.getElementById("userWord").textContent =
+    metric === "usd" ? "$" : "Tokens";
+  var ut = {};
+  rs.forEach(function(r){ var u = r.U || UNATTR;
+    ut[u] = (ut[u] || 0) + val(r); });
+  bars("userbars", Object.keys(ut).map(function(u){
+      return {m:u, v:ut[u]}; }).sort(function(a,b){ return b.v-a.v; }),
+    function(p){ return p.m === UNATTR ? C.muted : C.ink; }); }
 
 document.getElementById("gran").textContent = D.granularity;
 (function(){
@@ -942,8 +1135,10 @@ def html_report(path, days=None, only_user=None):
     own usage, not an unrequested league table of everyone's spend. Pass
     only_user=None explicitly (CLI: --all) for the org-wide roll-up."""
     events = _all_usage_events()
+    n_unattributed = sum(1 for e in events if e["user"] == UNATTRIBUTED)
     if only_user:
-        events = [e for e in events if (e.get("user") or "?") == only_user]
+        events = [e for e in events
+                  if (e.get("user") or UNATTRIBUTED) == only_user]
     if days:
         cutoff = (datetime.datetime.now().astimezone()
                   - datetime.timedelta(days=days)).isoformat()
@@ -974,12 +1169,27 @@ def html_report(path, days=None, only_user=None):
         for m, r in sorted(by_model.items(), key=lambda kv: -(kv[1]["i"]
                                                               + kv[1]["o"])))
 
+    # Say out loud what happened to identity-less rows. Silently dropping them
+    # (when filtered to one person) or silently absorbing them (what the old
+    # reader-identity default did) both produce a total nobody can check.
+    if n_unattributed and only_user and only_user != UNATTRIBUTED:
+        id_note = (f" · {n_unattributed:,} event(s) carry no user field and are "
+                   f"EXCLUDED from this single-person view — they are not "
+                   f"yours to claim; use --all or --user {UNATTRIBUTED}")
+    elif n_unattributed:
+        id_note = (f" · {n_unattributed:,} event(s) carry no user field and are "
+                   f"bucketed as '{UNATTRIBUTED}'")
+    else:
+        id_note = ""
+
     data_json = json.dumps({"rows": rows, "granularity": granularity}
                            ).replace("</", "<\\/")
     html = (_HTML_TEMPLATE
             .replace("@@GENERATED@@", datetime.datetime.now().astimezone()
                      .isoformat(timespec="minutes"))
             .replace("@@SPAN@@", ("last %g days" % days) if days else "all time")
+            .replace("@@IDNOTE@@", escape_html(id_note))
+            .replace("@@UNATTR@@", UNATTRIBUTED)
             .replace("@@TABLE@@", table)
             .replace("@@PRICENOTE@@", escape_html(price_note))
             .replace("@@DATA@@", data_json))
@@ -1000,7 +1210,11 @@ def main(argv=None):
     sub = ap.add_subparsers(dest="cmd", required=True)
     p = sub.add_parser("report")
     p.add_argument("--by", default="project-model",
-                   choices=["project", "model", "user", "project-model"])
+                   choices=["project", "repo", "model", "user", "machine",
+                            "project-model"],
+                   help="repo = the cross-developer join key (canonical git "
+                        "remote); project = the local folder name, which "
+                        "differs between developers")
     p.add_argument("--windows", action="store_true")
     p.add_argument("--days", type=float)
     p.add_argument("--all", action="store_true",
@@ -1019,6 +1233,12 @@ def main(argv=None):
     p = sub.add_parser("ingest", help="import subscription-tool usage "
                        "(flat-fee plans) into the ledger as derived events")
     p.add_argument("tool", choices=["claude-code", "codex"])
+    p.add_argument("--refresh", action="store_true",
+                   help="OPT-IN MIGRATION: re-derive rows already in the "
+                        "ledger so fields added to the importer later (e.g. "
+                        "`repo`, the cross-developer join key) reach records "
+                        "imported before they existed. Rewrites existing "
+                        "rows; the default never does.")
     a = ap.parse_args(argv)
 
     if a.cmd == "report":
@@ -1060,7 +1280,10 @@ def main(argv=None):
                     print(f"{ts} {model:32s} in=${pin:<8g} out=${pout:g}")
         return 0
     if a.cmd == "ingest":
-        (ingest_claude_code if a.tool == "claude-code" else ingest_codex)()
+        if a.tool == "claude-code":
+            ingest_claude_code(refresh=a.refresh)
+        else:
+            ingest_codex()
         return 0
     return 1
 
