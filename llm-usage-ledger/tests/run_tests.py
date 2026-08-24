@@ -52,20 +52,44 @@ def run_suite():
     with tempfile.TemporaryDirectory() as td:
         os.environ["LLM_TOKEN_LEDGER_DIR"] = td
 
-        # 2. ledger write/read roundtrip with full schema
-        usage = {"prompt_tokens": 100, "completion_tokens": 20,
-                 "completion_tokens_details": {"reasoning_tokens": 7}}
-        ev = lp.log_usage("test-model", usage, 1.5, task_tag="unit")
+        # 2. ledger write/read roundtrip with full schema. Registry-tag the
+        # repo (fake HOME, like 9a2 below) so d1 is populated instead of
+        # silently absent, and assert on `back[0]` — what actually survived
+        # the write-to-disk + read_ledgers()/_normalize() trip — not on `ev`,
+        # the in-memory dict log_usage() was about to write. Checking `ev`
+        # would pass even if serialization or _normalize() dropped a field.
+        fake_home_ru = Path(td) / "home-roundtrip"
+        (fake_home_ru / ".agent-coach").mkdir(parents=True)
+        repo_key = lp.repo_remote_key(".")
+        (fake_home_ru / ".agent-coach" / "projects.json").write_text(
+            json.dumps({repo_key: {"d1": "D1-TEST-CODE"}}))
+        real_home_ru = Path.home
+        Path.home = staticmethod(lambda: fake_home_ru)  # noqa
+        try:
+            usage = {"prompt_tokens": 100, "completion_tokens": 20,
+                     "completion_tokens_details": {"reasoning_tokens": 7}}
+            ev = lp.log_usage("test-model", usage, 1.5, task_tag="unit")
+        finally:
+            Path.home = real_home_ru
         back = lp.read_ledgers()
         check("ledger_roundtrip", len(back) == 1
               and back[0]["prompt_tokens"] == 100
-              and back[0]["reasoning_tokens"] == 7,
+              and back[0]["reasoning_tokens"] == 7
+              and back[0]["repo"] == repo_key
+              and back[0]["d1"] == "D1-TEST-CODE"
+              and back[0]["task_tag"] == "unit",
               f"got {back!r}")
-        required = {"ts", "duration_s", "provider", "machine", "user",
-                    "project", "model", "prompt_tokens", "completion_tokens",
-                    "reasoning_tokens", "task_tag"}
-        check("schema_complete", required.issubset(ev.keys()),
-              f"missing {required - set(ev.keys())}")
+        # Every field log_usage()+read_ledgers() actually produce for a live
+        # (non-ingested) event — SCHEMA.md's v1 set minus tokens_in/tokens_out
+        # (a *different* writer's schema, exercised separately below) and
+        # minus subscription/cache_*/src_id (ingest-only, see schema_complete_ingest).
+        required = {"schema", "ts", "duration_s", "provider", "machine",
+                    "user", "project", "repo", "d1", "model",
+                    "prompt_tokens", "completion_tokens", "reasoning_tokens",
+                    "task_tag"}
+        check("schema_complete", required.issubset(back[0].keys()),
+              f"missing {required - set(back[0].keys())}, "
+              f"got {sorted(back[0].keys())}")
 
         # 2b. provider param recorded (default stays lmstudio for back-compat)
         ev_p = lp.log_usage("test-model", {"prompt_tokens": 1,
@@ -214,8 +238,19 @@ def run_suite():
         fake_home = Path(td) / "home"
         proj = fake_home / ".claude" / "projects" / "-Users-x-repo"
         proj.mkdir(parents=True)
+        # A real (non-git) cwd, not "/Users/x/repo" (which doesn't exist on
+        # disk): project_tag() only runs when Path(cwd).is_dir() is True, so
+        # a fake path silently takes the d1=None fallback and d1 could never
+        # round-trip through this test. unjoinable_repo_key() is used because
+        # this dir has no git remote.
+        fake_cwd = Path(td) / "fake-repo-cwd"
+        fake_cwd.mkdir()
+        cwd_key = lp.unjoinable_repo_key(str(fake_cwd))
+        (fake_home / ".agent-coach").mkdir(parents=True)
+        (fake_home / ".agent-coach" / "projects.json").write_text(
+            json.dumps({cwd_key: {"d1": "D1-INGEST-TEST"}}))
         line = json.dumps({"uuid": "u-1", "timestamp": "2026-07-27T01:02:03Z",
-                           "cwd": "/Users/x/repo",
+                           "cwd": str(fake_cwd),
                            "message": {"model": "claude-sonnet-5", "usage": {
                                "input_tokens": 10,
                                "cache_creation_input_tokens": 90,
@@ -238,8 +273,25 @@ def run_suite():
                   and recs[0]["cache_w5_tokens"] == 90
                   and recs[0]["cache_read_tokens"] == 1000
                   and recs[0]["subscription"] is True
-                  and recs[0]["project"] == "repo")
+                  and recs[0]["project"] == fake_cwd.name)
         check("claude_code_ingest", ok, f"derived={derived!r}")
+
+        # 9a2b. full ingest schema survives read_ledgers()/_normalize(), not
+        # just the raw on-disk write 9a2 checked above.
+        back_ingest = [e for e in lp.read_ledgers(scope="all")
+                       if e.get("provider") == "claude-code"]
+        required_ingest = {"schema", "src_id", "ts", "provider",
+                           "subscription", "machine", "user", "project",
+                           "repo", "d1", "model", "prompt_tokens",
+                           "completion_tokens", "cache_read_tokens",
+                           "cache_w5_tokens", "cache_w1h_tokens", "task_tag"}
+        check("schema_complete_ingest",
+              len(back_ingest) == 1
+              and required_ingest.issubset(back_ingest[0].keys())
+              and back_ingest[0]["repo"] == cwd_key
+              and back_ingest[0]["d1"] == "D1-INGEST-TEST",
+              f"missing {required_ingest - set(back_ingest[0].keys()) if back_ingest else required_ingest}, "
+              f"got {back_ingest!r}")
 
         # 9a3. subscription rows separate in aggregation + cache discount
         (Path(td) / "prices.jsonl").write_text(
