@@ -1,0 +1,73 @@
+# Scheduled Azure DevOps Pipeline: merges every machine's pushed ledger
+# deltas (see ../scripts/push_ledger.py) from the Artifacts feed and renders
+# the shared llm-usage-ledger dashboard to Blob static website hosting.
+#
+# NOT wired to run on push to this repo — it is schedule-only, and the
+# checkout below exists purely to get render_dashboard.py + llm_usage_ledger.py
+# onto the agent, not because a code change should trigger a render.
+#
+# Setup (see the handoff doc / chat for the exact one-time az commands):
+#   - variable group `llm-usage-ledger-dashboard` with DEVOPS_ORG, DEVOPS_PROJECT,
+#     DEVOPS_FEED, STORAGE_ACCOUNT (plain values, not secrets — nothing here
+#     is a credential; the pipeline authenticates via its Azure service
+#     connection's managed identity)
+#   - pipeline variable AZURE_SERVICE_CONNECTION naming that service connection
+#   - the service connection's identity needs: Reader on the Artifacts feed,
+#     Storage Blob Data Contributor on the storage account
+#
+# COST NOTE before enabling the hourly schedule below: Microsoft-hosted
+# agents are billed per pipeline-minute past the org's free tier (commonly
+# 1,800 min/month on a private project). This job runs a few minutes;
+# hourly is 24 runs/day (~720-2000+ min/month depending on run time) which
+# may exceed a private org's free tier, daily is 30 runs/month and is
+# negligible under any plan. Pick ONE schedule below and delete the other —
+# don't leave both active.
+trigger: none
+
+schedules:
+  # Hourly — cheap only if the org has spare hosted-agent minutes; see the
+  # cost note above. DELETE this block (or comment it out) if using daily
+  # instead.
+  - cron: "0 * * * *"
+    displayName: Hourly ledger dashboard render
+    branches:
+      include: [main]
+    always: true
+
+  # Daily at 06:00 UTC — negligible cost on any plan. Uncomment and delete
+  # the hourly block above to use this instead.
+  # - cron: "0 6 * * *"
+  #   displayName: Daily ledger dashboard render
+  #   branches:
+  #     include: [main]
+  #   always: true
+
+pool:
+  vmImage: ubuntu-latest
+
+variables:
+  - group: llm-usage-ledger-dashboard
+
+steps:
+  - checkout: self
+    persistCredentials: false
+
+  - task: UsePythonVersion@0
+    inputs:
+      versionSpec: '3.11'
+
+  - script: az extension add --name azure-devops -y
+    displayName: Install azure-devops CLI extension
+
+  - task: AzureCLI@2
+    displayName: Render + publish shared dashboard
+    inputs:
+      azureSubscription: '$(AZURE_SERVICE_CONNECTION)'
+      scriptType: bash
+      scriptLocation: inlineScript
+      inlineScript: |
+        set -euo pipefail
+        python3 llm-usage-ledger/scripts/render_dashboard.py \
+          --org "$(DEVOPS_ORG)" --project "$(DEVOPS_PROJECT)" \
+          --feed "$(DEVOPS_FEED)" --storage-account "$(STORAGE_ACCOUNT)" \
+          --out "$(Agent.TempDirectory)/llm-spend.html"
