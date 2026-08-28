@@ -1,0 +1,7 @@
+{
+  "skill_name": "sg1",
+  "run_id": "20270201_000000_00000_nocaseids000",
+  "evaluator_version": "0.9.0",
+  "agents": {"codex": {"model": "gpt-5-nano", "with_skill": {},
+                       "without_skill": {}, "lift": {}}}
+}
