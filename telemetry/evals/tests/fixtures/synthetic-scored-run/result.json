@@ -1,0 +1,150 @@
+{
+  "skill_name": "sg-synthetic",
+  "run_id": "20260101_000000_00000_synthetic0000",
+  "evaluated_at": "2026-01-01T00:10:00+00:00",
+  "duration_seconds": 123.5,
+  "evaluator_version": "0.2.0",
+  "metric_set": "skill-evaluator-default-v2",
+  "metrics": [
+    "security",
+    "skill_execution",
+    "skill_efficiency",
+    "accuracy",
+    "goal_accuracy",
+    "behavior_check"
+  ],
+  "execution_status": "complete",
+  "attempt_policy": {
+    "max_attempts": 3,
+    "pass_threshold": 0.5,
+    "stop_on_pass": false
+  },
+  "run_config": {
+    "grading": {
+      "mode": "default_plus_custom"
+    },
+    "judge": {
+      "enabled": true,
+      "provider": "openai",
+      "model": "gpt-5.6-sol"
+    },
+    "harbor": {
+      "n_attempts": 3
+    },
+    "agents": {
+      "claude": {
+        "agent": "claude",
+        "model": "claude-opus-5"
+      }
+    }
+  },
+  "agents": {
+    "claude": {
+      "model": "claude-opus-5",
+      "execution_status": "complete",
+      "with_skill": {
+        "sk-case-alpha": 0.86,
+        "sk-case-beta": {
+          "overall": 0.5,
+          "n_trials": 3
+        },
+        "sk-case-gamma": 0.7,
+        "sk-case-delta": 0.6
+      },
+      "without_skill": {
+        "sk-case-alpha": 0.42,
+        "sk-case-beta": {
+          "overall": 0.55
+        },
+        "sk-case-delta": 0.5
+      },
+      "lift": {
+        "sk-case-alpha": 0.44,
+        "sk-case-beta": -0.05,
+        "sk-case-delta": 0.1,
+        "sk-case-epsilon": 0.22
+      },
+      "custom_lift": {
+        "sk-case-alpha": 0.4
+      },
+      "dimensions_with_skill": {
+        "sk-case-alpha": {
+          "security": 0.9,
+          "accuracy": 0.82
+        }
+      },
+      "dimensions_without_skill": {
+        "sk-case-alpha": {
+          "security": 0.4,
+          "accuracy": 0.44
+        }
+      },
+      "pass_at_k": {
+        "with_skill": {
+          "sk-case-alpha": 1.0
+        },
+        "without_skill": {
+          "sk-case-alpha": 0.33
+        }
+      },
+      "trial_failures": {
+        "with_skill": [],
+        "without_skill": [
+          {
+            "trial": "sk-case-gamma__ZZ11aa",
+            "reason": "JudgeTimeoutError: judge call exceeded 300s"
+          }
+        ]
+      },
+      "conditions": {
+        "with_skill": {
+          "execution_status": "complete",
+          "expected_attempts": 12,
+          "scored_attempts": 12
+        },
+        "without_skill": {
+          "execution_status": "partial",
+          "execution_errors": [
+            "Scored attempt coverage is 9/12"
+          ],
+          "expected_attempts": 12,
+          "scored_attempts": 9
+        }
+      }
+    }
+  },
+  "dataset_snapshot": {
+    "schema_version": "1.0",
+    "evaluator_version": "0.2.0",
+    "dataset": [
+      {
+        "id": "sk-case-alpha",
+        "expected_skill": "secret-guard"
+      },
+      {
+        "id": "sk-case-beta",
+        "expected_skill": "secret-guard"
+      },
+      {
+        "id": "sk-case-gamma",
+        "expected_skill": "secret-guard"
+      },
+      {
+        "id": "sk-case-delta",
+        "expected_skill": "ghost-skill-not-in-repo"
+      },
+      {
+        "id": "sk-case-epsilon",
+        "expected_skill": "secret-guard"
+      }
+    ],
+    "dataset_summary": {
+      "total_tasks": 5,
+      "positive_tasks": 5,
+      "negative_tasks": 0,
+      "source": "dataset"
+    },
+    "dataset_digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+    "dataset_digest_algorithm": "skill-evaluator-dataset-snapshot/1"
+  }
+}

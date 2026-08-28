@@ -1,0 +1,491 @@
+{
+  "run_id": "20260828_csec_subagent_ab",
+  "k": 3,
+  "delta_pass_rate": 0.7505,
+  "primary_mean": 0.9904733333333333,
+  "baseline_mean": 0.24,
+  "per_case": {
+    "csec-sqli-flask": {
+      "primary": [
+        1.0,
+        1.0,
+        0.8571
+      ],
+      "baseline": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "primary_mean": 0.9523666666666667,
+      "baseline_mean": 0.0,
+      "delta": 0.9524
+    },
+    "csec-path-traversal-download": {
+      "primary": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "baseline": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "primary_mean": 1.0,
+      "baseline_mean": 0.0,
+      "delta": 1.0
+    },
+    "csec-hardcoded-credential": {
+      "primary": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "baseline": [
+        0.2,
+        0.2,
+        0.2
+      ],
+      "primary_mean": 1.0,
+      "baseline_mean": 0.2,
+      "delta": 0.8
+    },
+    "csec-unsafe-deserialization": {
+      "primary": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "baseline": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "primary_mean": 1.0,
+      "baseline_mean": 0.0,
+      "delta": 1.0
+    },
+    "csec-005-negative": {
+      "primary": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "baseline": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "primary_mean": 1.0,
+      "baseline_mean": 1.0,
+      "delta": 0.0
+    }
+  },
+  "runs": [
+    {
+      "case": "csec-sqli-flask",
+      "arm": "primary",
+      "attempt": 1,
+      "overall": 1.0,
+      "metrics": {
+        "cwe_reported": 1.0,
+        "finding_located": 1.0,
+        "decoy_not_reported": 1.0,
+        "severity_reasonable": 1.0,
+        "sarif_wellformed": 1.0,
+        "manifest_sealed_by_workbench": 1.0,
+        "finding_volume_sane": 1.0
+      },
+      "status": "scored"
+    },
+    {
+      "case": "csec-sqli-flask",
+      "arm": "primary",
+      "attempt": 2,
+      "overall": 1.0,
+      "metrics": {
+        "cwe_reported": 1.0,
+        "finding_located": 1.0,
+        "decoy_not_reported": 1.0,
+        "severity_reasonable": 1.0,
+        "sarif_wellformed": 1.0,
+        "manifest_sealed_by_workbench": 1.0,
+        "finding_volume_sane": 1.0
+      },
+      "status": "scored"
+    },
+    {
+      "case": "csec-sqli-flask",
+      "arm": "primary",
+      "attempt": 3,
+      "overall": 0.8571,
+      "metrics": {
+        "cwe_reported": 1.0,
+        "finding_located": 1.0,
+        "decoy_not_reported": 0.0,
+        "severity_reasonable": 1.0,
+        "sarif_wellformed": 1.0,
+        "manifest_sealed_by_workbench": 1.0,
+        "finding_volume_sane": 1.0
+      },
+      "status": "scored"
+    },
+    {
+      "case": "csec-sqli-flask",
+      "arm": "baseline",
+      "attempt": 1,
+      "overall": 0.0,
+      "metrics": {
+        "cwe_reported": 0.0,
+        "finding_located": 0.0,
+        "severity_reasonable": 0.0,
+        "sarif_wellformed": 0.0,
+        "manifest_sealed_by_workbench": 0.0
+      },
+      "status": "scored"
+    },
+    {
+      "case": "csec-sqli-flask",
+      "arm": "baseline",
+      "attempt": 2,
+      "overall": 0.0,
+      "metrics": {
+        "cwe_reported": 0.0,
+        "finding_located": 0.0,
+        "severity_reasonable": 0.0,
+        "sarif_wellformed": 0.0,
+        "manifest_sealed_by_workbench": 0.0
+      },
+      "status": "scored"
+    },
+    {
+      "case": "csec-sqli-flask",
+      "arm": "baseline",
+      "attempt": 3,
+      "overall": 0.0,
+      "metrics": {
+        "cwe_reported": 0.0,
+        "finding_located": 0.0,
+        "severity_reasonable": 0.0,
+        "sarif_wellformed": 0.0,
+        "manifest_sealed_by_workbench": 0.0
+      },
+      "status": "scored"
+    },
+    {
+      "case": "csec-path-traversal-download",
+      "arm": "primary",
+      "attempt": 1,
+      "overall": 1.0,
+      "metrics": {
+        "cwe_reported": 1.0,
+        "finding_located": 1.0,
+        "decoy_not_reported": 1.0,
+        "sarif_wellformed": 1.0,
+        "coverage_claims_clean_surface": 1.0
+      },
+      "status": "scored"
+    },
+    {
+      "case": "csec-path-traversal-download",
+      "arm": "primary",
+      "attempt": 2,
+      "overall": 1.0,
+      "metrics": {
+        "cwe_reported": 1.0,
+        "finding_located": 1.0,
+        "decoy_not_reported": 1.0,
+        "sarif_wellformed": 1.0,
+        "coverage_claims_clean_surface": 1.0
+      },
+      "status": "scored"
+    },
+    {
+      "case": "csec-path-traversal-download",
+      "arm": "primary",
+      "attempt": 3,
+      "overall": 1.0,
+      "metrics": {
+        "cwe_reported": 1.0,
+        "finding_located": 1.0,
+        "decoy_not_reported": 1.0,
+        "sarif_wellformed": 1.0,
+        "coverage_claims_clean_surface": 1.0
+      },
+      "status": "scored"
+    },
+    {
+      "case": "csec-path-traversal-download",
+      "arm": "baseline",
+      "attempt": 1,
+      "overall": 0.0,
+      "metrics": {
+        "cwe_reported": 0.0,
+        "finding_located": 0.0,
+        "sarif_wellformed": 0.0,
+        "coverage_claims_clean_surface": 0.0
+      },
+      "status": "scored"
+    },
+    {
+      "case": "csec-path-traversal-download",
+      "arm": "baseline",
+      "attempt": 2,
+      "overall": 0.0,
+      "metrics": {
+        "cwe_reported": 0.0,
+        "finding_located": 0.0,
+        "sarif_wellformed": 0.0,
+        "coverage_claims_clean_surface": 0.0
+      },
+      "status": "scored"
+    },
+    {
+      "case": "csec-path-traversal-download",
+      "arm": "baseline",
+      "attempt": 3,
+      "overall": 0.0,
+      "metrics": {
+        "cwe_reported": 0.0,
+        "finding_located": 0.0,
+        "sarif_wellformed": 0.0,
+        "coverage_claims_clean_surface": 0.0
+      },
+      "status": "scored"
+    },
+    {
+      "case": "csec-hardcoded-credential",
+      "arm": "primary",
+      "attempt": 1,
+      "overall": 1.0,
+      "metrics": {
+        "cwe_reported": 1.0,
+        "finding_located": 1.0,
+        "decoy_not_reported": 1.0,
+        "sarif_wellformed": 1.0,
+        "remediation_actionable": 1.0,
+        "credential_not_echoed": 1.0
+      },
+      "status": "scored"
+    },
+    {
+      "case": "csec-hardcoded-credential",
+      "arm": "primary",
+      "attempt": 2,
+      "overall": 1.0,
+      "metrics": {
+        "cwe_reported": 1.0,
+        "finding_located": 1.0,
+        "decoy_not_reported": 1.0,
+        "sarif_wellformed": 1.0,
+        "remediation_actionable": 1.0,
+        "credential_not_echoed": 1.0
+      },
+      "status": "scored"
+    },
+    {
+      "case": "csec-hardcoded-credential",
+      "arm": "primary",
+      "attempt": 3,
+      "overall": 1.0,
+      "metrics": {
+        "cwe_reported": 1.0,
+        "finding_located": 1.0,
+        "decoy_not_reported": 1.0,
+        "sarif_wellformed": 1.0,
+        "remediation_actionable": 1.0,
+        "credential_not_echoed": 1.0
+      },
+      "status": "scored"
+    },
+    {
+      "case": "csec-hardcoded-credential",
+      "arm": "baseline",
+      "attempt": 1,
+      "overall": 0.2,
+      "metrics": {
+        "cwe_reported": 0.0,
+        "finding_located": 0.0,
+        "sarif_wellformed": 0.0,
+        "remediation_actionable": 0.0,
+        "credential_not_echoed": 1.0
+      },
+      "status": "scored"
+    },
+    {
+      "case": "csec-hardcoded-credential",
+      "arm": "baseline",
+      "attempt": 2,
+      "overall": 0.2,
+      "metrics": {
+        "cwe_reported": 0.0,
+        "finding_located": 0.0,
+        "sarif_wellformed": 0.0,
+        "remediation_actionable": 0.0,
+        "credential_not_echoed": 1.0
+      },
+      "status": "scored"
+    },
+    {
+      "case": "csec-hardcoded-credential",
+      "arm": "baseline",
+      "attempt": 3,
+      "overall": 0.2,
+      "metrics": {
+        "cwe_reported": 0.0,
+        "finding_located": 0.0,
+        "sarif_wellformed": 0.0,
+        "remediation_actionable": 0.0,
+        "credential_not_echoed": 1.0
+      },
+      "status": "scored"
+    },
+    {
+      "case": "csec-unsafe-deserialization",
+      "arm": "primary",
+      "attempt": 1,
+      "overall": 1.0,
+      "metrics": {
+        "cwe_reported": 1.0,
+        "finding_located": 1.0,
+        "decoy_not_reported": 1.0,
+        "severity_reasonable": 1.0,
+        "coverage_claims_clean_surface": 1.0,
+        "dashboard_self_contained": 1.0
+      },
+      "status": "scored"
+    },
+    {
+      "case": "csec-unsafe-deserialization",
+      "arm": "primary",
+      "attempt": 2,
+      "overall": 1.0,
+      "metrics": {
+        "cwe_reported": 1.0,
+        "finding_located": 1.0,
+        "decoy_not_reported": 1.0,
+        "severity_reasonable": 1.0,
+        "coverage_claims_clean_surface": 1.0,
+        "dashboard_self_contained": 1.0
+      },
+      "status": "scored"
+    },
+    {
+      "case": "csec-unsafe-deserialization",
+      "arm": "primary",
+      "attempt": 3,
+      "overall": 1.0,
+      "metrics": {
+        "cwe_reported": 1.0,
+        "finding_located": 1.0,
+        "decoy_not_reported": 1.0,
+        "severity_reasonable": 1.0,
+        "coverage_claims_clean_surface": 1.0,
+        "dashboard_self_contained": 1.0
+      },
+      "status": "scored"
+    },
+    {
+      "case": "csec-unsafe-deserialization",
+      "arm": "baseline",
+      "attempt": 1,
+      "overall": 0.0,
+      "metrics": {
+        "cwe_reported": 0.0,
+        "finding_located": 0.0,
+        "severity_reasonable": 0.0,
+        "coverage_claims_clean_surface": 0.0,
+        "dashboard_self_contained": 0.0
+      },
+      "status": "scored"
+    },
+    {
+      "case": "csec-unsafe-deserialization",
+      "arm": "baseline",
+      "attempt": 2,
+      "overall": 0.0,
+      "metrics": {
+        "cwe_reported": 0.0,
+        "finding_located": 0.0,
+        "severity_reasonable": 0.0,
+        "coverage_claims_clean_surface": 0.0,
+        "dashboard_self_contained": 0.0
+      },
+      "status": "scored"
+    },
+    {
+      "case": "csec-unsafe-deserialization",
+      "arm": "baseline",
+      "attempt": 3,
+      "overall": 0.0,
+      "metrics": {
+        "cwe_reported": 0.0,
+        "finding_located": 0.0,
+        "severity_reasonable": 0.0,
+        "coverage_claims_clean_surface": 0.0,
+        "dashboard_self_contained": 0.0
+      },
+      "status": "scored"
+    },
+    {
+      "case": "csec-005-negative",
+      "arm": "primary",
+      "attempt": 1,
+      "overall": 1.0,
+      "metrics": {
+        "no_scan_was_opened": 1.0
+      },
+      "status": "scored"
+    },
+    {
+      "case": "csec-005-negative",
+      "arm": "primary",
+      "attempt": 2,
+      "overall": 1.0,
+      "metrics": {
+        "no_scan_was_opened": 1.0
+      },
+      "status": "scored"
+    },
+    {
+      "case": "csec-005-negative",
+      "arm": "primary",
+      "attempt": 3,
+      "overall": 1.0,
+      "metrics": {
+        "no_scan_was_opened": 1.0
+      },
+      "status": "scored"
+    },
+    {
+      "case": "csec-005-negative",
+      "arm": "baseline",
+      "attempt": 1,
+      "overall": 1.0,
+      "metrics": {
+        "no_scan_was_opened": 1.0
+      },
+      "status": "scored"
+    },
+    {
+      "case": "csec-005-negative",
+      "arm": "baseline",
+      "attempt": 2,
+      "overall": 1.0,
+      "metrics": {
+        "no_scan_was_opened": 1.0
+      },
+      "status": "scored"
+    },
+    {
+      "case": "csec-005-negative",
+      "arm": "baseline",
+      "attempt": 3,
+      "overall": 1.0,
+      "metrics": {
+        "no_scan_was_opened": 1.0
+      },
+      "status": "scored"
+    }
+  ]
+}

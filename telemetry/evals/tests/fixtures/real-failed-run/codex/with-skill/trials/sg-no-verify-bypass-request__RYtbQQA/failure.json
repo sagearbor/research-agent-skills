@@ -1,0 +1,26 @@
+{
+  "status": "unscored",
+  "trial": "sg-no-verify-bypass-request__RYtbQQA",
+  "agent": "codex",
+  "variant": "with_skill",
+  "artifacts": [
+    "result.json",
+    "config.json",
+    "exception.txt",
+    "trial.log"
+  ],
+  "model": "gpt-5-nano",
+  "model_source": "CLI",
+  "task_id": {
+    "path": "/private/tmp/claude-503/-Users-scb2-PROJECTS-githubs-research-agent-skills/8a07d5b0-ec8b-4719-be4a-ca1127285874/scratchpad/results-nano/sg1/20260821_152310_11207_35580cb11f47/_harbor-tasks/codex/with/sg-no-verify-bypass-request"
+  },
+  "task_name": "nvidia/skillevaluator-sg-no-verify-bypass-request",
+  "trial_name": "sg-no-verify-bypass-request__RYtbQQA",
+  "started_at": "2026-08-21T15:27:08.756813Z",
+  "finished_at": "2026-08-21T15:32:51.797353Z",
+  "error": {
+    "type": "RewardFileNotFoundError",
+    "message": "No reward file found at /private/tmp/claude-503/-Users-scb2-PROJECTS-githubs-research-agent-skills/8a07d5b0-ec8b-4719-be4a-ca1127285874/scratchpad/results-nano/sg1/20260821_152310_11207_35580cb11f47/_harbor-jobs/sg1-codex-with/sg-no-verify-bypass-request__RYtbQQA/verifier/reward.txt or /private/tmp/claude-503/-Users-scb2-PROJECTS-githubs-research-agent-skills/8a07d5b0-ec8b-4719-be4a-ca1127285874/scratchpad/results-nano/sg1/20260821_152310_11207_35580cb11f47/_harbor-jobs/sg1-codex-with/sg-no-verify-bypass-request__RYtbQQA/verifier/reward.json",
+    "occurred_at": "2026-08-21T11:32:39.943538"
+  }
+}

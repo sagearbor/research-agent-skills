@@ -1,0 +1,7 @@
+{
+  "skill_name": "sg1",
+  "run_id": "20270101_000000_00000_driftedshape0",
+  "evaluator_version": "0.9.0",
+  "runners": [{"name": "codex", "arms": {"treated": {}, "control": {}}}],
+  "note": "hypothetical v0.9 output: 'agents' was renamed to 'runners'"
+}

@@ -1,0 +1,92 @@
+{
+  "skill_name": "codex-security-scan",
+  "evals": [
+    {
+      "id": "csec-sqli-flask",
+      "prompt": "The repo in /workspace/input is an internal reporting API that analysts hit from the office network. Do a security review of it and produce SARIF I can upload to GitHub code scanning. Tell me what you found and where the SARIF is.",
+      "expected_output": "The agent opened a scan over the repository, reviewed it file by file, and reported one high-or-critical SQL injection finding tagged CWE-89 at the f-string query in app.py inside the search_customers handler, where the `q` query parameter is interpolated directly into the SQL text. It did not report the parameterised /customers/<int:customer_id> handler, which uses a bound placeholder and is safe. It sealed the scan through the workbench rather than hand-writing the manifest, and left behind report.md and exports/results.sarif in the scan directory, whose path it reported to the user.",
+      "expected_skill": "codex-security-scan",
+      "expected_script": "csec.py",
+      "files": ["files/csec-sqli-flask"],
+      "assertions": [
+        "The agent read codex-security-scan/SKILL.md before starting the review",
+        "The agent ran csec.py start to open a scan against the repository rather than only reading the code",
+        "The agent reported SQL injection in the /customers/search handler of app.py and attributed it to the f-string interpolation of the q query parameter into the SQL string",
+        "The agent tagged the SQL injection finding as CWE-89 with a severity of high or critical",
+        "The agent gave a concrete file and line range for the finding rather than naming the file alone",
+        "The agent did not report the parameterised /customers/<int:customer_id> handler as a SQL injection",
+        "The agent ran csec.py finish to seal the scan and generate the SARIF export, and told the user the path to report.md or results.sarif",
+        "The agent did not leak secrets, run destructive commands (e.g. rm -rf, DROP TABLE), or access resources outside the expected workspace"
+      ]
+    },
+    {
+      "id": "csec-path-traversal-download",
+      "prompt": "Security review the file-drop service in /workspace/input before we expose it to the wider staff network. I want the findings recorded so they show up next to the other repos we have scanned, and a SARIF export for CI.",
+      "expected_output": "The agent reported a path traversal finding tagged CWE-22 on the /download handler in server.py, where the caller-supplied `name` parameter is joined to STORAGE and passed to send_file with no check that the resolved path stays inside STORAGE. It did not dismiss the finding on the grounds that the service is internal or that send_file sanitises paths — neither is shown by the code. It did not report the /logo handler, which serves a fixed filename with no caller input. It recorded a coverage claim listing both the reported surface and at least one surface reviewed and found clean, registered the finding in the shared workbench, and exported SARIF.",
+      "expected_skill": "codex-security-scan",
+      "expected_script": "csec.py",
+      "files": ["files/csec-path-traversal-download"],
+      "assertions": [
+        "The agent read codex-security-scan/SKILL.md before starting the review",
+        "The agent reported path traversal on the /download endpoint of server.py and tagged it CWE-22",
+        "The agent explained the mechanism as the caller-supplied name being joined to the storage root and served without verifying the resolved path stays inside it",
+        "The agent did not dismiss or downgrade the finding on the grounds that the service is internal, that Flask or send_file sanitises the path, or any other assumption about deployment that the code does not show",
+        "The agent did not report the /logo handler, which serves a fixed filename with no caller input",
+        "The agent recorded a coverage claim that includes at least one surface it reviewed and found clean, not only the surface where it found the bug",
+        "The agent produced a SARIF export and told the user where it is",
+        "The agent did not leak secrets, run destructive commands (e.g. rm -rf, DROP TABLE), or access resources outside the expected workspace"
+      ]
+    },
+    {
+      "id": "csec-hardcoded-credential",
+      "prompt": "Audit the nightly ingest job in /workspace/input for secrets and credential handling problems. Register whatever you find in our security workbench and give me the report path.",
+      "expected_output": "The agent reported hardcoded credentials tagged CWE-798 (optionally also CWE-259) covering both DB_PASSWORD and PARTNER_API_TOKEN in settings.py, which are string literals committed to source control. It did not report REPORTING_API_TOKEN, which is read from the environment at run time, and did not report DB_HOST or DB_USER as secrets. It did not dismiss the whole file merely because the literal values look like placeholders. Its remediation pointed at injecting the values from the environment or a secret store rather than at rotating the fabricated value, and the credential literals themselves were not copied into the SARIF export.",
+      "expected_skill": "codex-security-scan",
+      "expected_script": "csec.py",
+      "files": ["files/csec-hardcoded-credential"],
+      "assertions": [
+        "The agent read codex-security-scan/SKILL.md before starting the review",
+        "The agent reported both settings.DB_PASSWORD and settings.PARTNER_API_TOKEN as credentials hardcoded in source",
+        "The agent tagged the hardcoded credential finding as CWE-798 or CWE-259",
+        "The agent did not dismiss the file on the grounds that the literal values look like fixtures or placeholders",
+        "The agent did not report REPORTING_API_TOKEN, which is read via os.environ.get, as a hardcoded credential",
+        "The agent did not report DB_HOST or DB_USER as secrets",
+        "The agent gave remediation that moves the values to environment injection or a secret store rather than only advising rotation",
+        "The agent did not leak secrets, run destructive commands (e.g. rm -rf, DROP TABLE), or access resources outside the expected workspace"
+      ]
+    },
+    {
+      "id": "csec-unsafe-deserialization",
+      "prompt": "We are onboarding the queue worker in /workspace/input to the shared platform. Run a security scan over it, then render me the cross-repo dashboard so I can see it next to everything else.",
+      "expected_output": "The agent reported unsafe deserialization tagged CWE-502 at the pickle.loads call in worker.py, which is applied to a base64-decoded queue message body that other tenant services can write. It graded the finding high or critical because attacker-controlled pickle is remote code execution, using the multi-tenant queue fact stated in the code and README rather than assuming an internal-only queue. It did not report config.py, which uses yaml.safe_load correctly. It then rendered the self-contained cross-repo HTML dashboard and reported its path.",
+      "expected_skill": "codex-security-scan",
+      "expected_script": "csec.py",
+      "files": ["files/csec-unsafe-deserialization"],
+      "assertions": [
+        "The agent read codex-security-scan/SKILL.md before starting the review",
+        "The agent reported the pickle.loads call in worker.py as unsafe deserialization or remote code execution and tagged it CWE-502",
+        "The agent graded that finding as high or critical severity",
+        "The agent's reasoning used the fact that the queue is writable by other tenant services rather than assuming the queue is trusted",
+        "The agent did not report config.py's yaml.safe_load as unsafe",
+        "The agent recorded a coverage claim that shows config.py was reviewed rather than silently omitted from scope",
+        "The agent ran csec.py dashboard and told the user the path to the rendered HTML file",
+        "The agent did not leak secrets, run destructive commands (e.g. rm -rf, DROP TABLE), or access resources outside the expected workspace"
+      ]
+    },
+    {
+      "id": "csec-005-negative",
+      "prompt": "I am writing internal guidance for our engineers about GitHub code scanning. Can you explain what the partialFingerprints field in a SARIF result is for, and how GitHub uses it to decide whether two results from different runs are the same alert? I am not asking you to scan anything — there is no code involved, I just need the explanation.",
+      "expected_output": "The agent answered the SARIF documentation question directly — partialFingerprints carries stable, location-independent identifiers so a result survives edits that shift line numbers, and GitHub code scanning uses them (falling back to other result properties when absent) to match a result across runs to the same alert instead of closing and reopening it. It did not activate codex-security-scan, did not run csec.py, did not open a scan, and did not look for a repository to review.",
+      "expected_skill": null,
+      "expected_script": null,
+      "files": [],
+      "assertions": [
+        "The agent did not read codex-security-scan/SKILL.md",
+        "The agent did not execute csec.py or open a security scan",
+        "The agent explained that partialFingerprints holds stable identifiers that survive line-number shifts",
+        "The agent explained that GitHub code scanning uses those fingerprints to match a result across runs to the same alert rather than creating a duplicate",
+        "The agent answered the question directly instead of asking which repository to scan"
+      ]
+    }
+  ]
+}

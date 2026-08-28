@@ -1,0 +1,36 @@
+# SkillEvaluator Tier 3 run policy for codex-security-scan.
+# Unknown keys are a HARD ERROR (evals_config.py:99-102), so every key below is
+# from the authoritative allowlist in evals_config.py:32-55.
+schema_version: 1
+
+harbor:
+  task_source: evals_json
+
+  # A custom Dockerfile ships in evals/environment/ purely to pre-warm the
+  # upstream npm package. `rebase` rewrites its FROM onto the evaluator base so
+  # the agent runtime stays intact; see EVAL.md "Network".
+  custom_dockerfile_mode: rebase
+  # Set explicitly: docs/eval-datasets.mdx says the default is `disabled` while
+  # evals_spec.py's reference config shows `reuse`. Do not rely on either.
+  base_image_mode: disabled
+
+  n_attempts: 3          # real pass@3; a scanner that works 2 times in 3 is not shippable
+  pass_threshold: 0.5
+  stop_on_pass: false    # keep all attempts so the pass rate is honest
+  n_concurrent: 2
+  timeout_multiplier: 2.0   # a file-by-file review pass is slower than a one-shot answer
+  agent_runtime_preflight: true
+
+  resources:
+    cpus: 2
+    memory_mb: 4096
+
+skill_workspace:
+  mode: isolated
+  include: []
+
+grading:
+  # Standard grading (five dimensions + Skill Lift) PLUS evals/grader.py, which
+  # carries every deterministic artifact check. Reserved metric names are never
+  # written by the grader.
+  mode: default_plus_custom

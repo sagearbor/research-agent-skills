@@ -12,6 +12,7 @@ import datetime
 import json
 import re
 import statistics
+import subprocess
 import sys
 import tempfile
 import time
@@ -56,6 +57,10 @@ def run_suite():
     check("upstream_pinned",
           re.fullmatch(r"\d+\.\d+\.\d+", (SKILL_DIR / "UPSTREAM_PIN").read_text().strip() or ""),
           "UPSTREAM_PIN must be an exact version")
+    check("skill_declares_runtime_npm_fetch",
+          "npm install" in sm and "at runtime" in sm and "network" in sm.lower(),
+          "SKILL.md must say plainly that the skill npm-installs upstream at "
+          "runtime — a marketplace reviewer screens on package installs")
 
     # ---- csec: enums + id stability ---------------------------------------
     import csec
@@ -75,6 +80,65 @@ def run_suite():
     check("finding_id_stable", a == b, "same input produced different ids")
     check("finding_id_distinct", a != c, "different paths collided")
     check("finding_id_shape", a.startswith("csf_") and len(a) == 28)
+
+    # ---- bootstrap(): the cache must be verified, not merely present --------
+    # Regression: bootstrap() used to test only `workbench().exists()`, so a
+    # cache warmed at an older pin (or edited in place) was used forever while
+    # the returned dict still reported `pinned`. Offline: npm is stubbed and
+    # must never be called, because a warm cache is the whole point.
+    def fake_cache(td, version):
+        """Minimal cache tree: a package.json version plus workbench_db.py."""
+        root = Path(td) / "node_modules" / csec.PKG
+        (root / "_bundled_plugin" / "scripts").mkdir(parents=True)
+        (root / "_bundled_plugin" / "scripts" / "workbench_db.py").write_text("#\n")
+        (root / "package.json").write_text(json.dumps({"version": version}))
+        return Path(td)
+
+    orig_cache, orig_pin, orig_run = csec.CACHE, csec.PIN, subprocess.run
+    installs = []
+    subprocess.run = lambda *a, **kw: installs.append(a) or (_ for _ in ()).throw(
+        AssertionError("bootstrap ran npm against a warm cache"))
+    try:
+        csec.PIN = "9.9.9"
+        with tempfile.TemporaryDirectory() as td:
+            csec.CACHE = fake_cache(td, "9.9.9")
+            try:
+                info = csec.bootstrap()
+                ok, why = info["version"] == "9.9.9", ""
+            except SystemExit as exc:
+                ok, why = False, str(exc)
+            check("bootstrap_accepts_matching_pin", ok, why or "rejected a good cache")
+            check("bootstrap_no_npm_when_warm", not installs,
+                  "npm ran even though the cache satisfied the pin")
+
+        with tempfile.TemporaryDirectory() as td:
+            csec.CACHE = fake_cache(td, "0.1.1")   # stale: pin says 9.9.9
+            try:
+                csec.bootstrap()
+                msg = None
+            except SystemExit as exc:
+                msg = str(exc)
+            check("bootstrap_rejects_stale_cache", msg is not None,
+                  "a stale cache was accepted silently — the original bug")
+            check("bootstrap_stale_message_actionable",
+                  bool(msg) and "9.9.9" in msg and "0.1.1" in msg
+                  and "--force" in msg and str(csec.CACHE) in msg,
+                  "failure must name wanted, found, the cache path and the fix")
+
+        with tempfile.TemporaryDirectory() as td:
+            csec.CACHE = fake_cache(td, "9.9.9")
+            (csec.CACHE / "node_modules" / csec.PKG / "package.json").write_text("{oops")
+            try:
+                csec.bootstrap()
+                unreadable = False
+            except SystemExit:
+                unreadable = True
+            check("bootstrap_rejects_unreadable_cache", unreadable,
+                  "an unparseable package.json must fail closed, not be ignored")
+            check("installed_version_none_when_unreadable",
+                  csec.installed_version() is None)
+    finally:
+        csec.CACHE, csec.PIN, subprocess.run = orig_cache, orig_pin, orig_run
 
     # ---- finish(): artifact assembly, without touching a real workbench ----
     calls = []
