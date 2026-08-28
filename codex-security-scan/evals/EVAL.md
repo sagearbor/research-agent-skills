@@ -11,8 +11,14 @@ evals/
 ├── config.yml                 schema_version 1, grading.mode default_plus_custom
 ├── grader.py                  BYOG deterministic checks → custom_metrics
 ├── environment/Dockerfile     pre-warms the npm package (see "Network")
-└── files/<case-id>/           fixture repos
+├── files/<case-id>/           fixture repos
+└── results-20260828.json      first executed run (see "Executed" below)
 ```
+
+**Status: executed once, 2026-08-28, outside SkillEvaluator.** See
+[Executed: 2026-08-28](#executed-2026-08-28--30-subagent-runs-k3) at the bottom
+for the numbers, the method, and two grader defects the run exposed. The Tier-3
+Docker path below is still UNVERIFIED — it was not needed and was not used.
 
 ---
 
@@ -218,3 +224,126 @@ by different reasoning. No other case overlaps a SKILL.md example.
 * **`n_attempts: 3` triples the bill.** Cost is `cases × agents × attempts ×
   arms` = 5 × agents × 3 × 2 = 30 agent runs per agent. Drop to `n_attempts: 1`
   for a first smoke run, then raise it once the contract is verified.
+
+---
+
+## Executed: 2026-08-28 — 30 subagent runs, k=3
+
+First actual execution of this eval set. **SkillEvaluator was not used**, and
+neither was `environment/Dockerfile`; both remain UNVERIFIED. The design above
+was executed by hand with Claude Code subagents, which needs no sandbox, no npm
+cache inside a container, and no `FROM`-line guess.
+
+### Method
+
+30 runs = 5 cases × 2 arms × k=3, one `general-purpose` subagent per run, each
+scoped to its own directory under a per-run root.
+
+| | with-skill arm ("primary") | no-skill arm ("baseline") |
+|---|---|---|
+| cases 1-4 | the `evals.json` prompt + "read `codex-security-scan/SKILL.md` and follow it" | **only** "review this repo for security vulnerabilities and report findings with file and line". No skill, no `csec.py`, no mention of SARIF or a workbench. |
+| case 5 (negative) | skill *offered* by name + description + path, with "use it if and only if it applies" — the over-triggering question | the `evals.json` prompt alone |
+
+Case 5 uses the case prompt in both arms because it has no repository; the
+generic baseline sentence would have asked a different question.
+
+Two deliberate deviations from the shipped instructions, applied to **both**
+arms so they cannot move the delta: SKILL.md **Rule 0** (the `run_tests.py
+--auto` telemetry append) was skipped, because these are not real usage and the
+residual-risk note above says so; and cases 2-5 were told "static review, do not
+create virtualenvs or run the app" after case 1's first primary run spent three
+minutes building a Flask venv to execute a proof-of-concept. Case 1 primary
+attempt 1 ran before that instruction existed and did execute a PoC.
+
+Isolation: each run got its own `CODEX_SECURITY_STATE_DIR`, so no case's
+findings could satisfy another's checks. The developer's real workbench at
+`~/.codex-security-state` was byte-identical before and after (92 files).
+
+### Scoring
+
+`grader.py` was **not** modified and not reimplemented — the driver imports it
+and calls `run_checks(case_id, spec)` unchanged. The only thing supplied is the
+sandbox the grader assumes:
+
+```python
+import grader
+os.environ["HOME"] = str(EMPTY_DIR)               # neutralise ~/.codex-security-state
+os.environ["CODEX_SECURITY_STATE_DIR"] = str(RUN / "state")
+grader.SEARCH_ROOTS = (str(RUN),)                 # this run's container-equivalent /workspace
+metrics, details = grader.run_checks(case, grader.CASES[case])
+```
+
+`SEARCH_ROOTS` is `("/workspace","/root","/home","/tmp")` because in the
+intended harness each case owns a container and those paths *are* that case's
+filesystem. Outside a container they are shared by every run on the machine, so
+they are repointed at the run directory — the container equivalent. The check
+logic is untouched.
+
+Sanity checks before the real runs: a hand-authored perfect scan scores
+`overall 1.0` across 7 metrics on case 1; an empty directory scores `0.0` across
+5 on case 1 and `1.0` on case 5. Both match this document's claims exactly.
+
+### Result
+
+`delta_pass_rate = primary.mean − baseline.mean = 0.990 − 0.240 = **+0.751**`
+
+| case | primary (k=3) | baseline (k=3) | delta |
+|---|---|---|---|
+| `csec-sqli-flask` | 1.00, 1.00, 0.86 | 0.00, 0.00, 0.00 | **+0.952** |
+| `csec-path-traversal-download` | 1.00, 1.00, 1.00 | 0.00, 0.00, 0.00 | **+1.000** |
+| `csec-hardcoded-credential` | 1.00, 1.00, 1.00 | 0.20, 0.20, 0.20 | **+0.800** |
+| `csec-unsafe-deserialization` | 1.00, 1.00, 1.00 | 0.00, 0.00, 0.00 | **+1.000** |
+| `csec-005-negative` | 1.00, 1.00, 1.00 | 1.00, 1.00, 1.00 | **+0.000** |
+
+Per-case deltas: mean +0.751, sd 0.428, n=5 cases. The noise band this document
+quotes for the intended harness is roughly −0.10…+0.05; four of five cases sit
+an order of magnitude outside it and the variance within an arm is near zero
+(29 of 30 runs scored exactly 0.00, 0.20 or 1.00). n=5 cases is still small, so
+the *aggregate* is not tightly bounded — but the per-case results are not
+ambiguous.
+
+**False positives on the negative case: zero.** All three with-skill attempts
+answered the `partialFingerprints` documentation question directly and opened no
+scan, so `no_scan_was_opened` = 1.0 in both arms. The skill's broad description
+("produce SARIF for CI") did not over-trigger on a question that contains the
+word SARIF.
+
+Raw per-run metrics: `results-20260828.json`. Ledger rows (one per case):
+`telemetry/evals/skill-lift.jsonl`, rendered by `telemetry/evals/render_lift.py`.
+
+### What the number does and does not mean
+
+**It measures artifacts, not detection.** Five of the seven case-1 metrics —
+and every metric on cases 2-4 except `decoy_not_reported` and
+`credential_not_echoed` — read a *sealed workbench finding*. Only the with-skill
+arm can produce one. The baseline arm therefore scores near zero **by
+construction**, whatever it finds, which is exactly what §"How the two grading
+halves split" predicted. +0.751 is a faithful measurement of "did the agent
+produce contract artifacts", and it is close to the ceiling that design allows.
+
+**Detection was a tie.** Read from the arms' prose reports (not from
+`grader.py`, and recorded here as an observation, not a score): the baseline
+arm named the planted sink at the right file and line, with the right CWE, in
+**12 of 12** positive runs, and explicitly declined to report the planted decoy
+in **12 of 12**. The with-skill arm did the same in 12 of 12. On these fixtures
+a competent unaided agent loses nothing on finding the bug — as this document
+predicted. What it loses is the SARIF, the sealed manifest, the coverage claim,
+and the cross-repo record.
+
+### Two grader defects this run exposed
+
+1. **`decoy_not_reported` is location-based, not class-based.** Case 1 primary
+   attempt 3 scored 0.86 because it filed a second, *legitimate* CWE-306
+   "both endpoints return PII with no authentication" finding whose location
+   spans `app.py:24-31` — inside the decoy window `("app.py", 24, 32)`. It did
+   not report the parameterised handler as SQL injection; it reported a
+   different vulnerability class that happens to live on those lines. The check
+   should require the offending finding to carry the case's own CWE, or the
+   decoy window should be narrowed to the `conn.execute` call.
+2. **`credential_not_echoed` hands the no-scan arm a free 1.0.** It is the
+   entire reason `csec-hardcoded-credential` baseline scores 0.20 rather than
+   0.00: with no SARIF on disk, no credential literal can appear in one. It is a
+   precision check and belongs in the same `undefined` tuple as
+   `decoy_not_reported` and `finding_volume_sane` when zero findings were
+   reported. Left as-is here so the published number comes from the grader as
+   the design shipped it; fixing it would move the delta from +0.751 to +0.791.
