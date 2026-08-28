@@ -11,9 +11,34 @@ finalizer. Only its *runner* is OpenAI-bound. This skill swaps the runner for
 **you** — Claude does the security reasoning, the upstream workbench does the
 bookkeeping, and **no code and no credentials leave the machine**.
 
-Upstream is **not vendored**. `csec.py` installs it from npm into a cache, so
-their improvements arrive on their own. `tests/contract_test.py` fails loudly
-if a release breaks an assumption this skill relies on.
+## Network and supply chain — read this before installing the skill
+
+**This skill downloads and installs a third-party npm package at runtime.**
+Upstream is deliberately **not vendored**, so the first `csec.py` command on a
+machine with a cold cache runs, over the network, against the public npm
+registry:
+
+```bash
+npm install @openai/codex-security@<UPSTREAM_PIN> --no-audit --no-fund
+```
+
+into `$CODEX_SECURITY_SKILL_CACHE` (default `~/.cache/codex-security-skill`).
+`bootstrap`, `doctor`, `start`, `finish`, `list` and `dashboard` all trigger it.
+Nothing is uploaded — no code, no findings and no credentials leave the machine
+— but the install itself is outbound network activity and installs code that
+this repository does not review, so an air-gapped or install-restricted
+environment cannot run this skill as shipped. Warm the cache once on a
+networked machine (or vendor `_bundled_plugin/`, accepting the redistribution
+duty in `NOTICE`) if that matters to you.
+
+The pin lives in `UPSTREAM_PIN`, and every `bootstrap()` **verifies the cached
+package's version against it** and refuses to run on a mismatch, so a cache
+warmed at an older pin cannot be reused silently. That is an identity check,
+not an integrity check: it detects drift, not tampering. `VERSION` is this
+skill's own version and is unrelated to `UPSTREAM_PIN`.
+
+`tests/contract_test.py` fails loudly if an upstream release breaks an
+assumption this skill relies on.
 
 ## Rules
 
@@ -38,10 +63,16 @@ if a release breaks an assumption this skill relies on.
 python3 <skill>/csec.py doctor
 ```
 
-Installs upstream into `~/.cache/codex-security-skill`, creates the shared
-workbench at `~/.codex-security-state`, and prints `pluginRoot`. Needs `npm`
-and Python 3.10+. Override paths with `CODEX_SECURITY_SKILL_CACHE` and
+Installs upstream into `~/.cache/codex-security-skill` (see **Network and
+supply chain** above), creates the shared workbench at
+`~/.codex-security-state`, and prints `pluginRoot`. Needs `npm` and Python
+3.10+. Override paths with `CODEX_SECURITY_SKILL_CACHE` and
 `CODEX_SECURITY_STATE_DIR`.
+
+If the cached upstream does not match `UPSTREAM_PIN`, every command fails
+closed with the wanted/found versions and the cache path. Refresh with
+`python3 <skill>/csec.py bootstrap --force`. Do not work around it by editing
+the pin.
 
 ## Scanning one repository
 

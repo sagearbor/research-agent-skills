@@ -61,8 +61,45 @@ def workbench() -> Path:
     return plugin_root() / "scripts" / "workbench_db.py"
 
 
+def installed_version() -> str | None:
+    """Version of upstream actually present in the cache, or None if unreadable."""
+    try:
+        pkg = json.loads((CACHE / "node_modules" / PKG / "package.json").read_text())
+        return str(pkg["version"])
+    except (OSError, json.JSONDecodeError, KeyError, TypeError):
+        return None
+
+
+def _stale_cache_error(found: str | None) -> str:
+    return (
+        f"upstream {PKG} in the cache does not match UPSTREAM_PIN.\n"
+        f"  wanted:  {PIN}\n"
+        f"  found:   {found or 'no readable package.json'}\n"
+        f"  cache:   {CACHE}\n"
+        "\n"
+        "Refresh it with:\n"
+        f"  python3 {Path(__file__).name} bootstrap --force\n"
+        f"(or delete {CACHE} and re-run any csec.py command).\n"
+        "\n"
+        "Refusing to scan: the cache supplies the methodology, JSON schemas, "
+        "SQLite workbench and SARIF finalizer this skill trusts, so a stale or "
+        "tampered copy silently changes what a scan means. Note that a version "
+        "match is an identity check, not an integrity check — if you suspect "
+        "tampering, delete the cache rather than trusting this comparison.")
+
+
 def bootstrap(force: bool = False) -> dict:
-    """Install upstream from npm into the cache. Idempotent and offline-safe."""
+    """Install upstream from npm into the cache, then VERIFY it against the pin.
+
+    Idempotent and offline-safe once the cache is warm. The cache is never
+    trusted on *existence* alone: checking only that `workbench_db.py` is on
+    disk means a cache warmed at an older pin — or one an attacker edited — is
+    reused forever, and `bootstrap()` still reports the pin it wished for. So
+    the installed version is compared to UPSTREAM_PIN on every call and a
+    mismatch **fails closed** with refresh instructions. Nothing is
+    auto-reinstalled: an unattended network install is not a safe way to answer
+    "this cache is not what you asked for".
+    """
     if force or not workbench().exists():
         CACHE.mkdir(parents=True, exist_ok=True)
         if not (CACHE / "package.json").exists():
@@ -72,7 +109,13 @@ def bootstrap(force: bool = False) -> dict:
         subprocess.run(["npm", "install", spec, "--no-audit", "--no-fund",
                         "--loglevel", "error"],
                        cwd=CACHE, check=True)
-    ver = json.loads((CACHE / "node_modules" / PKG / "package.json").read_text())["version"]
+    ver = installed_version()
+    if ver is None or (PIN != "latest" and ver != PIN):
+        raise SystemExit(_stale_cache_error(ver))
+    if not workbench().exists():
+        raise SystemExit(
+            f"upstream {PKG}@{ver} installed, but {workbench()} is missing — the "
+            "upstream package layout changed. Run tests/contract_test.py.")
     return {"version": ver, "pluginRoot": str(plugin_root()),
             "workbench": str(workbench()), "stateDir": str(STATE),
             "pinned": PIN}
