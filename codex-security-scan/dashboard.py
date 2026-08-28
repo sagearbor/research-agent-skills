@@ -154,8 +154,13 @@ def render(data: dict, title: str = "Security posture") -> str:
     for r in repos:
         by_repo[r.get("displayName") or "unknown"] = {s: 0 for s in ORDER}
     for f in open_f:
-        by_repo.setdefault(f.get("repository") or "unknown", {s: 0 for s in ORDER})
-        by_repo[f["repository"]][f["_sev"]] += 1
+        # Normalise onto the finding itself: the table cell, the data-repo filter
+        # attribute and this bucket must all agree, or a finding with no
+        # repository renders in a row the repo filter can never match.
+        name = f.get("repository") or "unknown"
+        f["repository"] = name
+        by_repo.setdefault(name, {s: 0 for s in ORDER})
+        by_repo[name][f["_sev"]] += 1
     clean = sum(1 for c in by_repo.values() if not sum(c.values()))
     stamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
 

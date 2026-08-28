@@ -110,6 +110,13 @@ Surfaces are your coverage claim: one row per area you reviewed, including the
 ones that came back clean (`no_issue_found`). A repo with zero findings still
 needs surfaces, otherwise the scan claims no coverage.
 
+`completeness` must be honest about open work: `complete` is rejected if any
+surface is `needs_follow_up` or `deferred` is non-empty. If you could not
+finish a surface — it needs a live run, a credential, a system you cannot
+reach — say `partial` and leave the surface `needs_follow_up`. Downgrading the
+completeness is the correct move; deleting the surface to keep `complete` is
+not.
+
 **Step 4 — seal and register.**
 
 ```bash

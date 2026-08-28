@@ -199,11 +199,27 @@ def finish(scan_dir: Path, analysis_path: Path) -> dict:
         s.setdefault("receiptRefs", [])
         if s.get("disposition") not in DISPOSITIONS:
             raise SystemExit(f"disposition {s.get('disposition')!r} not in {DISPOSITIONS}")
+
+    # Mirror of upstream's coverage cross-check (finalize_scan_contract.py:
+    # "complete coverage cannot have deferred work"). Upstream enforces this at
+    # seal time, from a subprocess, and reports it as an opaque ContractError.
+    # Fail here instead: same rule, but it names the offending surfaces and
+    # fires before the coverage/manifest artifacts are written or sealed.
+    completeness = a.get("completeness", "complete")
+    if completeness == "complete":
+        open_surfaces = [s.get("id") for s in surfaces
+                         if s.get("disposition") == "needs_follow_up"]
+        if open_surfaces or a.get("deferred"):
+            raise SystemExit(
+                f"completeness is 'complete' but work is still open: "
+                f"surfaces needing follow-up {open_surfaces or []}, "
+                f"{len(a.get('deferred') or [])} deferred item(s). "
+                f"Use completeness 'partial' (or resolve them).")
     mode = recipe["coverageMode"]
     (scan_dir / "coverage.json").write_text(json.dumps({
         "documentType": "codex-security.coverage", "schemaVersion": "1.0",
         "scanId": sid, "mode": mode,
-        "completeness": a.get("completeness", "complete"),
+        "completeness": completeness,
         "inventoryStrategy": mode if mode in INVENTORY else "custom",
         "includePaths": recipe["includePaths"],
         "excludePaths": recipe["excludePaths"],

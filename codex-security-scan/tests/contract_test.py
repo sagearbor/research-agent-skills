@@ -134,6 +134,18 @@ def main() -> int:
                    "taxonomy", "locations", "remediation", "provenance"} <= fr,
                   f"finding required fields changed: {sorted(fr)}")
 
+        # --- coverage cross-check csec.finish now mirrors locally -----------
+        # csec.finish pre-rejects completeness="complete" alongside a
+        # needs_follow_up surface or deferred work, so the model gets a clear
+        # early error instead of upstream's late ContractError. If upstream
+        # ever relaxes the rule, that mirror becomes over-strict — flag it.
+        fin = root / "scripts" / "finalize_scan_contract.py"
+        ftxt = fin.read_text(errors="ignore") if fin.is_file() else ""
+        check("upstream_rejects_complete_with_open_work",
+              'completeness == "complete"' in ftxt and "has_needs_follow_up" in ftxt,
+              "upstream no longer cross-checks completeness against open work — "
+              "csec.finish's local mirror of that rule may now be over-strict")
+
         # --- upstream python stays local-only -------------------------------
         net = []
         for p in (root / "scripts").rglob("*.py"):

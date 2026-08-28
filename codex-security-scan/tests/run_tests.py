@@ -150,6 +150,58 @@ def run_suite():
                   rejects(lambda b: b["findings"][0].update(locations=[]), "loc"))
             check("rejects_bad_disposition",
                   rejects(lambda b: b["surfaces"][0].update(disposition="maybe"), "disp"))
+
+            # Coverage consistency: upstream's finalize_scan_contract rejects
+            # "complete" coverage that still has open work, but only at seal
+            # time from a subprocess. csec.finish must catch it first, or the
+            # model gets an opaque late ContractError. This fired for real on
+            # the 2026-08-28 irb_agent_dcri scan.
+            check("rejects_complete_with_needs_follow_up",
+                  rejects(lambda b: (b.update(completeness="complete"),
+                                     b["surfaces"].append(
+                                         {"id": "s2", "label": "L2",
+                                          "disposition": "needs_follow_up"})),
+                          "follow-up"),
+                  "completeness 'complete' alongside a needs_follow_up surface "
+                  "must be rejected locally, not by upstream at seal time")
+            check("rejects_complete_with_deferred",
+                  rejects(lambda b: (b.update(completeness="complete",
+                                              deferred=[{"id": "d1"}])), "deferred"),
+                  "completeness 'complete' with deferred work must be rejected")
+
+            # ...but the same shape under "partial" is legitimate and must seal.
+            part = json.loads(json.dumps(good))
+            part["completeness"] = "partial"
+            part["surfaces"].append({"id": "s2", "label": "L2",
+                                     "disposition": "needs_follow_up"})
+            ap.write_text(json.dumps(part))
+            try:
+                csec.finish(sd, ap)
+                cov2 = json.loads((sd / "coverage.json").read_text())
+                check("accepts_partial_with_needs_follow_up",
+                      cov2["completeness"] == "partial"
+                      and any(s["disposition"] == "needs_follow_up"
+                              for s in cov2["surfaces"]),
+                      "an honest partial scan must still be sealable")
+            except SystemExit as e:
+                check("accepts_partial_with_needs_follow_up", False,
+                      f"over-strict: partial + follow-up rejected ({e})")
+
+            # Zero-finding scan: a clean repo must still produce a coverage
+            # claim, otherwise "found nothing" is indistinguishable from
+            # "reviewed nothing".
+            ap.write_text(json.dumps({"findings": [], "surfaces": []}))
+            out0 = csec.finish(sd, ap)
+            cov0 = json.loads((sd / "coverage.json").read_text())
+            check("zero_findings_seals",
+                  json.loads((sd / "findings.json").read_text())["findings"] == [],
+                  "a clean repo must still seal")
+            check("zero_findings_default_surface",
+                  len(cov0["surfaces"]) == 1
+                  and cov0["surfaces"][0]["disposition"] == "no_issue_found",
+                  "a findings-free scan must default to a no_issue_found "
+                  "coverage surface, not an empty surfaces list")
+            ap.write_text(json.dumps(good))
     finally:
         csec.wb = orig
 
@@ -183,6 +235,42 @@ def run_suite():
           "repo with zero findings not shown as clean")
     check("dash_has_table_view", "<table" in h, "no table view for accessibility")
     check("dash_order_worst_first", ORDER[0] == "critical")
+
+    # A first run, or an all-clean estate, renders an empty workbench. The
+    # dashboard is the deliverable a second person sees, so it must not blow up
+    # before it can say "nothing found".
+    try:
+        empty = page({"repositories": [], "findings": []}, "T")
+        check("dash_empty_workbench", "<table" in empty and "0" in empty)
+    except Exception as e:  # noqa: BLE001 - any exception is the bug
+        check("dash_empty_workbench", False, f"empty estate crashed: {e!r}")
+
+    # collect() normally fills in `repository`, but page() is also a public
+    # entrypoint (dashboard.py <json>). A finding with no repository must
+    # bucket as "unknown", not raise KeyError midway through rendering.
+    for label, bad in (("missing", {"findingId": "f", "severity": {"level": "high"},
+                                    "status": "open", "title": "t", "summary": "s"}),
+                       ("null", {"findingId": "f", "repository": None,
+                                 "severity": {"level": "high"}, "status": "open",
+                                 "title": "t", "summary": "s"})):
+        try:
+            out = page({"repositories": [], "findings": [bad]}, "T")
+            check(f"dash_repo_{label}_bucketed_unknown", "unknown" in out,
+                  "finding without a repository was not bucketed as unknown")
+        except Exception as e:  # noqa: BLE001
+            check(f"dash_repo_{label}_bucketed_unknown", False,
+                  f"repository {label} crashed the render: {e!r}")
+
+    # Severity is a closed enum downstream, but the dashboard reads whatever the
+    # workbench hands it; an unknown level must degrade, not KeyError on META.
+    try:
+        odd = page({"repositories": [], "findings": [
+            {"findingId": "f", "repository": "r", "severity": {"level": "urgent"},
+             "status": "open", "title": "t", "summary": "s"}]}, "T")
+        check("dash_unknown_severity_degrades", META["informational"]["icon"] in odd,
+              "an unrecognised severity must fall back to informational")
+    except Exception as e:  # noqa: BLE001
+        check("dash_unknown_severity_degrades", False, f"crashed: {e!r}")
     return r
 
 
