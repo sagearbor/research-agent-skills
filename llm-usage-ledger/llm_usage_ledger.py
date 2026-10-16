@@ -540,6 +540,13 @@ def prices_update(models=None):
                             "source": f"litellm:{hit[2]}"})
             if normalize_model_name(m) in local_models:
                 open_rates.append(hit)
+    for tier in FRONTIER_TIERS:
+        hit = newest_claude(table, tier)
+        if hit:
+            entries.append({"ts": today, "model": f"frontier-{tier}",
+                            "input_per_m": round(hit[0], 4),
+                            "output_per_m": round(hit[1], 4),
+                            "source": f"litellm:{hit[2]}"})
     if open_rates:
         entries.append({"ts": today, "model": "reference-open",
                         "input_per_m": round(statistics.median(h[0] for h in open_rates), 4),
@@ -573,10 +580,54 @@ def load_price_series() -> dict:
 
 
 # How local rows are priced: "same-model" (default — renting the same open
-# model in the cloud) or "frontier" (the counterfactual "had I used a frontier
-# cloud model instead": every local row at the dated `reference` benchmark).
-# Set by `report --local-as`.
+# model in the cloud) or a Claude tier "haiku" | "sonnet" | "opus" | "fable"
+# (counterfactual "had this work run on that Claude model instead"). Tier
+# prices are dated `frontier-<tier>` rows appended by `prices update`, taken
+# from the NEWEST claude-<tier>-X-Y listed in the live table, so the model is
+# named and checkable. Set by `report --local-as` (operator choice 2026-10-16:
+# the org standardised on Claude Code, so Claude is the reference family).
+FRONTIER_TIERS = ("haiku", "sonnet", "opus", "fable")
+DEFAULT_FRONTIER_TIER = "sonnet"
 LOCAL_PRICING = "same-model"
+
+
+def newest_claude(table: dict, family: str):
+    """(input_per_m, output_per_m, key) for the highest-versioned
+    first-party `claude-<family>-X[-Y]` entry, or None."""
+    best = None
+    for key, info in table.items():
+        m = re.fullmatch(rf"claude-{family}-(\d+)(?:-(\d+))?", key)
+        if not m or not isinstance(info, dict):
+            continue
+        ci, co = info.get("input_cost_per_token"), info.get("output_cost_per_token")
+        if not ci or not co:
+            continue
+        ver = (int(m.group(1)), int(m.group(2) or 0))
+        if len(m.group(2) or "") >= 8:  # dated snapshot, not a version
+            ver = (int(m.group(1)), 0)
+        if best is None or ver > best[0]:
+            best = (ver, ci * 1e6, co * 1e6, key)
+    return best and best[1:]
+
+
+def frontier_source(tier: str) -> str:
+    """'claude-sonnet-5-5 $2/$10 per M, as of 2026-10-16' from the latest
+    frontier-<tier> price row (falls back to the reference benchmark)."""
+    last = None
+    if prices_file().exists():
+        for line in prices_file().read_text().splitlines():
+            try:
+                e = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if e.get("model") == f"frontier-{tier}":
+                last = e
+    if not last:
+        r = CLOUD_REFERENCE_RATES[CURRENT_RATE_KEY]
+        return (f"no frontier-{tier} price yet — run `prices update`; using reference "
+                f"${r['input_per_m']:g}/${r['output_per_m']:g} per M")
+    return (f"{last['source'].removeprefix('litellm:')} ${last['input_per_m']:g}/"
+            f"${last['output_per_m']:g} per M, as of {last['ts']}")
 
 
 def as_of_price(model: str, ts: str, series: dict, local: bool = False):
@@ -590,8 +641,8 @@ def as_of_price(model: str, ts: str, series: dict, local: bool = False):
     """
     day = (ts or "")[:10]
     keys = [(normalize_model_name(model), "model")]
-    if local and LOCAL_PRICING == "frontier":
-        keys = []
+    if local and LOCAL_PRICING in FRONTIER_TIERS:
+        keys = [(f"frontier-{LOCAL_PRICING}", "frontier")]
     elif local:
         keys.append(("reference-open", "reference-open"))
     keys.append(("reference", "reference"))
@@ -1219,11 +1270,11 @@ def html_report(path, days=None, only_user=None):
 
     priced = {normalize_model_name(e["model"]) for e in events if e["local"]
               and as_of_price(e["model"], e["ts"], series, local=True)[2] == "model"}
-    if LOCAL_PRICING == "frontier":
-        r = CLOUD_REFERENCE_RATES[CURRENT_RATE_KEY]
-        price_note = (f"LOCAL ROWS PRICED AS A FRONTIER CLOUD MODEL (${r['input_per_m']:g}/M in, "
-                      f"${r['output_per_m']:g}/M out) — the 'had I used a frontier model instead' "
-                      "counterfactual; default view prices them as the same open model rented")
+    if LOCAL_PRICING in FRONTIER_TIERS:
+        src = frontier_source(LOCAL_PRICING)
+        price_note = (f"LOCAL ROWS PRICED AS CLAUDE {LOCAL_PRICING.upper()} ({src}) — the "
+                      "'had this work run on that Claude model instead' counterfactual; the "
+                      "default view prices them as the same open model rented")
     else:
       price_note = (f"per-model hosted rates for {len(priced)} local model(s), "
                     "open-model median (reference-open) for unpriced local models" if priced else
@@ -1298,10 +1349,12 @@ def main(argv=None):
     p.add_argument("--user", help="restrict to one user (default: you)")
     p.add_argument("--open", action="store_true",
                    help="open the generated --html dashboard in the browser")
-    p.add_argument("--local-as", choices=["same-model", "frontier"], default="same-model",
+    p.add_argument("--local-as", choices=["same-model", "frontier", *FRONTIER_TIERS],
+                   default="same-model",
                    help="price local-model rows as the SAME open model rented in the cloud "
-                        "(default), or as a FRONTIER cloud model (counterfactual: 'had I used "
-                        "a frontier model instead'); frontier HTML defaults to llm-spend-frontier.html")
+                        "(default), or as a Claude tier haiku|sonnet|opus|fable (newest model of "
+                        "that family in the live price table; 'frontier' = sonnet). "
+                        "HTML defaults to llm-spend-<tier>.html")
     p.add_argument("--html", nargs="?", const="__DEFAULT__",
                    metavar="PATH", help="write a self-contained graphical "
                    "HTML report (charts over the whole ledger dir) to PATH")
@@ -1322,10 +1375,11 @@ def main(argv=None):
 
     if a.cmd == "report":
         global LOCAL_PRICING
-        LOCAL_PRICING = a.local_as
+        LOCAL_PRICING = (DEFAULT_FRONTIER_TIER if a.local_as == "frontier"
+                         else a.local_as)
         if a.html == "__DEFAULT__":
-            a.html = str(default_report_path() if a.local_as == "same-model"
-                         else reports_dir() / "llm-spend-frontier.html")
+            a.html = str(default_report_path() if LOCAL_PRICING == "same-model"
+                         else reports_dir() / f"llm-spend-{LOCAL_PRICING}.html")
         if a.html:
             # Shared dir => default to just you. Local dir is already just you,
             # so the flag is a no-op there and nobody has to think about it.
