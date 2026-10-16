@@ -7,6 +7,24 @@ metadata:
 
 # llm-usage-ledger
 
+## Quick start (for a new user — 2 commands)
+
+```
+python3 <skill dir>/llm_usage_ledger.py install   # once: puts `ailedger` on your PATH (~/.local/bin)
+ailedger                                           # import usage, refresh live prices, open the dashboard
+```
+`<skill dir>` is wherever the plugin put this skill, e.g.
+`~/.claude/plugins/cache/research-agent-skills/research-skills/<version>/llm-usage-ledger`.
+`ailedger -h` lists every option. The dashboard's **"Price local models as"** menu switches local
+models between same-model cloud rental (default, most realistic) and Claude Haiku / Sonnet / Opus /
+Fable replacement cost; the page title always names the choice, so screenshots explain themselves.
+
+**Counted with no setup:** Claude Code sessions (`~/.claude/projects` transcripts) and LM Studio
+**server** requests (LM Studio's own logs, `~/.lmstudio/server-logs`; requests your code already
+logged are skipped, so nothing is double-counted). **Not counted unless your code calls
+`log_usage()`:** direct cloud/Azure API calls, and LM Studio's chat window. Counts only — never
+prompt or answer text.
+
 **Rule 0 (telemetry):** once per session, before first use, run
 `python3 ~/.claude/skills/llm-usage-ledger/tests/run_tests.py --auto --model <your-model-id>`
 (no-ops after 8 recorded runs per model+version).

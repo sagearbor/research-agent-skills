@@ -1,0 +1,90 @@
+#!/bin/bash
+# ailedger — short front door to the llm-usage-ledger skill (LLM tokens + money saved).
+# Lives in <skill>/bin/; finds llm_usage_ledger.py next to itself, so it works from
+# any clone or plugin-cache copy. Install the command once with:
+#   python3 <skill>/llm_usage_ledger.py install
+SELF="$0"; while [ -L "$SELF" ]; do T=$(readlink "$SELF"); case $T in /*) SELF=$T;; *) SELF=$(dirname "$SELF")/$T;; esac; done
+L="$(cd "$(dirname "$SELF")/.." && pwd)/llm_usage_ledger.py"
+REPORT="$HOME/.llm_token_ledger/reports/llm-spend.html"
+
+usage() {
+cat <<'EOF'
+ailedger — see your LLM usage and money saved (Claude plan, Codex plan, local models, Azure)
+
+USAGE
+  ailedger                 import sessions, refresh live prices (once/day), rebuild + open dashboard
+  (pricing)                the dashboard has a "Price local models as" menu: same-model rental
+                           (default, most realistic) or Claude Haiku/Sonnet/Opus/Fable replacement
+                           cost. The title shows the choice, so screenshots are self-explaining.
+  ailedger -f [TIER]       same page with the menu preset to TIER (haiku|sonnet|opus|fable)
+  ailedger -o              open the LAST dashboard, no rebuild (instant)
+  ailedger -q              rebuild + open WITHOUT importing new usage first (faster)
+  ailedger -t [BY]         text table in the terminal; BY = model (default) | repo | project | user | machine | project-model
+  ailedger -t model -n 30  same, last 30 days only
+  ailedger -w              burst analysis (busiest time windows) in the terminal
+  ailedger -i              only import new usage: Claude Code sessions + LM Studio server logs
+  ailedger -p              fetch live public prices now (same LiteLLM table `npx ccusage` uses;
+                           appends dated rows, never edits — old reports stay reproducible)
+  ailedger -P              show the price list
+  ailedger -- ARGS...      pass ARGS straight to llm_usage_ledger.py (e.g. ailedger -- report --help)
+  ailedger -h              this help
+
+FLAGS
+  -f [TIER] Claude counterfactual -o   open last dashboard
+  -q   quick: skip session import
+  -t   terminal table [BY]        -n N only the last N days (with -t or -w)
+  -w   burst windows              -i   import sessions only
+  -p   update prices              -P   list prices
+  -h   help
+
+WHERE THINGS ARE
+  Dashboard page : ~/.llm_token_ledger/reports/llm-spend.html  (use the Local / Cloud / Subscription
+                   filter at the top; hover for $ and tokens)
+  Raw ledger     : ~/.llm_token_ledger/*.jsonl  (append-only)
+WHAT IS COUNTED WITHOUT ANY SETUP
+  Claude Code sessions (your ~/.claude transcripts) and LM Studio SERVER requests (its own logs).
+  NOT counted unless your code calls log_usage(): direct cloud/Azure API calls, LM Studio's chat window.
+
+READING THE $
+  Local rows  = cost AVOIDED (you paid $0 marginal) = renting the SAME model in the cloud:
+                Azure's listing if it exists, else the median across hosts; unlisted models use the
+                median of your other local models (never the frontier rate).
+  Claude choices = what the same local work would have cost on that Claude model (named in
+                  the title). Haiku vs Fable differ ~100x — quote the one you can defend.
+  Subscription rows = what the flat-fee plan absorbed at API prices.
+  Cloud rows  = estimated spend at public rates (not your Azure invoice).
+EOF
+}
+
+[ -f "$L" ] || { echo "ailedger: cannot find $L — reinstall: python3 <skill>/llm_usage_ledger.py install" >&2; exit 1; }
+
+prices_daily() {  # like `npx ccusage`: fetch live public prices (LiteLLM table), at most once a day
+  P="$HOME/.llm_token_ledger/prices.jsonl"; T=$(date +%F)
+  tail -1 "$P" 2>/dev/null | grep -q "\"ts\": \"$T\"" || python3 "$L" prices update >/dev/null 2>&1 || echo "ailedger: price refresh failed (offline?) — using last saved prices" >&2
+}
+
+ingest() {  # Claude Code sessions + LM Studio server logs (idempotent, seconds)
+  python3 "$L" ingest all >/dev/null 2>&1 || echo "ailedger: session/log import hit an error — run: ailedger -i" >&2
+}
+
+case "${1:-}" in
+  ""|-d)  ingest; prices_daily; python3 "$L" report --html --open ;;
+  -q)     python3 "$L" report --html --open ;;
+  -f)     TIER=${2:-sonnet}
+          case "$TIER" in haiku|sonnet|opus|fable) ;; *) echo "ailedger: -f takes haiku|sonnet|opus|fable" >&2; exit 2;; esac
+          ingest; prices_daily; python3 "$L" report --local-as "$TIER" --html --open ;;
+  -o)     [ -f "$REPORT" ] && open "$REPORT" || { echo "no dashboard yet — run: ailedger" >&2; exit 1; } ;;
+  -t)     shift; BY=model
+          if [ -n "${1:-}" ] && [ "${1#-}" = "$1" ]; then BY=$1; shift; fi
+          ARGS=(report --by "$BY")
+          [ "${1:-}" = "-n" ] && ARGS+=(--days "$2")
+          python3 "$L" "${ARGS[@]}" ;;
+  -w)     shift; ARGS=(report --windows); [ "${1:-}" = "-n" ] && ARGS+=(--days "$2")
+          python3 "$L" "${ARGS[@]}" ;;
+  -i)     python3 "$L" ingest all ;;
+  -p)     python3 "$L" prices update ;;
+  -P)     python3 "$L" prices list ;;
+  --)     shift; python3 "$L" "$@" ;;
+  -h|--help|help) usage ;;
+  *)      echo "ailedger: unknown option '$1'" >&2; echo; usage; exit 2 ;;
+esac

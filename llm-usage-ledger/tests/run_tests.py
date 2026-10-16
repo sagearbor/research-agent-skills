@@ -539,6 +539,41 @@ def run_suite():
           f"got {_L.project_tag('.')}")
 
     check("cli_help", p.returncode == 0)
+
+    # LM Studio server-log importer: counts only, idempotent, dedupes against
+    # calls another writer already logged, and never copies text (2026-10-16).
+    with tempfile.TemporaryDirectory() as td3:
+        os.environ["LLM_TOKEN_LEDGER_DIR"] = td3
+        logs = Path(td3) / "lms"
+        (logs / "2026-10").mkdir(parents=True)
+        block = (lambda rid, tin, tout, hh: (
+            f"[2026-10-16 {hh}:00:05][INFO][m] Generated prediction: {{\n"
+            f'  "id": "{rid}",\n  "model": "qwen3.5-122b-a10b",\n'
+            f'  "choices": [{{"message": {{"content": "PRIVATE TEXT"}}}}],\n'
+            f'  "usage": {{"prompt_tokens": {tin}, "completion_tokens": {tout}}}\n}}\n'))
+        (logs / "2026-10" / "a.log").write_text(
+            "[2026-10-16 09:00:00][DEBUG] Received request: POST {\n  \"x\": 1\n}\n"
+            + block("chatcmpl-1", 100, 10, "09") + block("chatcmpl-2", 200, 20, "10"))
+        # chatcmpl-2's call was already logged by the user's own code
+        when = _L.datetime.datetime(2026, 10, 16, 10, 0, 30).astimezone().isoformat()
+        (Path(td3) / "own.jsonl").write_text(json.dumps({
+            "ts": when, "provider": "local", "model": "qwen3.5-122b-a10b",
+            "prompt_tokens": 200, "completion_tokens": 20}) + "\n")
+        os.environ["LMSTUDIO_LOG_DIR"] = str(logs)
+        _L.ingest_lmstudio(); _L.ingest_lmstudio()
+        out = _L._ingest_derived_file(_L.LMSTUDIO_TAG)
+        rows = [json.loads(x) for x in out.read_text().splitlines()]
+        check("lmstudio_ingest_counts_dedupes_idempotent",
+              [r["src_id"] for r in rows] == ["chatcmpl-1"] and rows[0]["prompt_tokens"] == 100
+              and _L.is_local_event(rows[0]), f"got {rows}")
+        check("lmstudio_ingest_never_copies_text", "PRIVATE" not in out.read_text())
+        os.environ.pop("LMSTUDIO_LOG_DIR", None)
+        b = Path(td3) / "bin"
+        shim = _L.install_cli(b)
+        check("install_writes_launcher", shim.exists() and os.access(shim, os.X_OK)
+              and "ailedger launcher" in shim.read_text()
+              and str(Path(_L.__file__).resolve().parent) in shim.read_text())
+    os.environ.pop("LLM_TOKEN_LEDGER_DIR", None)
     return r
 
 

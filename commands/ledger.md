@@ -23,7 +23,8 @@ Map `$ARGUMENTS` to a subcommand:
 | `dashboard <N>` | same with `--days <N>` | ditto |
 | `report` | `<script> report --days 60` | the table |
 | `by project` / `by user` / `by model` | `<script> report --days 60 --by project\|user\|model` | the table |
-| `ingest` | `<script> ingest claude-code` | how many events were added (idempotent) |
+| `ingest` | `<script> ingest all` | how many events were added from Claude Code and LM Studio logs (idempotent) |
+| `install` | `<script> install` | that `ailedger` is now a terminal command (`ailedger -h`) |
 | `prices` | `<script> prices list` | first ~10 rows and the total count |
 | `prices update` | `<script> prices update` | how many rows appended |
 | `where` | `echo ${LLM_TOKEN_LEDGER_DIR:-~/.llm_token_ledger}` then `ls -la` that dir | which dir is active, and whether it is shared or local |

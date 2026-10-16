@@ -830,6 +830,115 @@ def ingest_claude_code(refresh: bool = False):
         _ingest_error("claude-code", n_err, shape_err)
 
 
+_LMS_PRED = re.compile(r"^\[(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d)\]\[INFO\]\[[^\]]*\] "
+                       r"Generated prediction: \{\s*$")
+LMSTUDIO_TAG = "lmstudio-log"
+
+
+def lmstudio_log_dir() -> Path:
+    return Path(os.environ.get("LMSTUDIO_LOG_DIR")
+                or Path.home() / ".lmstudio" / "server-logs")
+
+
+def _lmstudio_predictions(path: Path):
+    """Yield (ts_naive_str, prediction_dict) for every completed request in an
+    LM Studio server log. The block is a pretty-printed OpenAI response that
+    starts on the `Generated prediction: {` line and ends at a bare `}`. Only
+    id/model/usage are used; message content is parsed and dropped."""
+    buf, ts = None, None
+    with open(path, encoding="utf-8", errors="replace") as fh:
+        for line in fh:
+            if buf is None:
+                m = _LMS_PRED.match(line)
+                if m:
+                    buf, ts = ["{"], m.group(1)
+                continue
+            buf.append(line)
+            if line.rstrip("\n") == "}":
+                text = "".join(buf)
+                buf = None
+                try:
+                    yield ts, json.loads(text)
+                except json.JSONDecodeError as e:
+                    digest = hashlib.sha256(text.encode("utf-8", "replace")).hexdigest()[:16]
+                    yield ts, {"_error": f"err={type(e).__name__} len={len(text)} sha256={digest}"}
+
+
+def ingest_lmstudio():
+    """Import local-model usage from LM Studio's own server logs
+    (~/.lmstudio/server-logs, override LMSTUDIO_LOG_DIR), so anyone running
+    LM Studio's server gets local savings with NO code changes. Idempotent
+    (merged by the response id). Requests your own code already logged via
+    log_usage()/another ledger writer (same model + exact token counts within
+    15 minutes) are skipped, so nothing is counted twice. Counts only: the
+    prompt and answer text in the log are never copied. LM Studio's chat
+    window is not covered — only requests to its local server (API)."""
+    src = lmstudio_log_dir()
+    if not src.is_dir():
+        print(f"ingest lmstudio: no LM Studio server logs at {src} — nothing to do")
+        return
+    out = _ingest_derived_file(LMSTUDIO_TAG)
+    existing = {}
+    if out.exists():
+        for line in out.read_text().splitlines():
+            try:
+                e = json.loads(line)
+                existing[e["src_id"]] = e
+            except (json.JSONDecodeError, KeyError):
+                continue
+    # Already-logged local calls from other writers: (model, tin, tout) -> [epoch...]
+    logged = defaultdict(list)
+    for e in read_ledgers(scope="all"):
+        if e.get("task_tag") == LMSTUDIO_TAG or not is_local_event(e):
+            continue
+        try:
+            t = datetime.datetime.fromisoformat(e["ts"]).timestamp()
+        except (KeyError, ValueError, TypeError):
+            continue
+        logged[(normalize_model_name(e.get("model", "")), e.get("prompt_tokens"),
+                e.get("completion_tokens"))].append(t)
+    n_new = n_dup = n_err = 0
+    first_err = None
+    for f in sorted(src.rglob("*.log")):
+        for ts, d in _lmstudio_predictions(f):
+            if "_error" in d:
+                n_err += 1
+                first_err = first_err or d["_error"]
+                continue
+            u = d.get("usage") or {}
+            rid = d.get("id")
+            if not rid or not isinstance(u, dict) or u.get("prompt_tokens") is None:
+                continue
+            if rid in existing:
+                continue
+            when = datetime.datetime.strptime(ts, "%Y-%m-%d %H:%M:%S").astimezone()
+            model = d.get("model") or "lmstudio-unknown"
+            key = (normalize_model_name(model), u.get("prompt_tokens"), u.get("completion_tokens"))
+            if any(abs(when.timestamp() - t) <= 900 for t in logged.get(key, ())):
+                n_dup += 1
+                continue
+            details = u.get("completion_tokens_details") or {}
+            existing[rid] = {
+                "schema": SCHEMA_VERSION, "src_id": rid,
+                "ts": when.isoformat(timespec="seconds"),
+                "provider": "lmstudio", "machine": machine_name(), "user": whoami(),
+                "project": "lmstudio-server", "model": model,
+                "prompt_tokens": u.get("prompt_tokens"),
+                "completion_tokens": u.get("completion_tokens"),
+                "reasoning_tokens": details.get("reasoning_tokens"),
+                "task_tag": LMSTUDIO_TAG}
+            n_new += 1
+    with _write_lock:
+        ledger_dir().mkdir(parents=True, exist_ok=True)
+        with open(out, "w") as fh:
+            for e in existing.values():
+                fh.write(json.dumps(e) + "\n")
+    print(f"ingest lmstudio: {n_new} new requests, {n_dup} skipped (already logged by "
+          f"your code), {len(existing)} total -> {out}")
+    if n_err:
+        _ingest_error("lmstudio", n_err, first_err)
+
+
 def ingest_codex():
     """Codex CLI importer — stub until a real session format is in hand."""
     src = Path.home() / ".codex"
@@ -842,6 +951,46 @@ def ingest_codex():
           f"added, describe its shape (field names, not values) to "
           f"{ingest_contact()}. Do not send transcript content: this ledger "
           f"records counts, never what was said.")
+
+
+# ----------------------------------------------------------------- install
+_SHIM = """#!/bin/bash
+# ailedger launcher — written by `llm_usage_ledger.py install`. Re-run that to update.
+# Runs the newest llm-usage-ledger it can find, so plugin updates never break it.
+DEV=@@DEV@@
+for d in "$LLM_USAGE_LEDGER_HOME" "$DEV" \\
+         "$(ls -d "$HOME"/.claude/plugins/cache/*/research-skills/*/llm-usage-ledger 2>/dev/null | sort -V | tail -1)" \\
+         "$HOME/.claude/skills/llm-usage-ledger"; do
+  [ -n "$d" ] && [ -x "$d/bin/ailedger" ] && exec "$d/bin/ailedger" "$@"
+done
+echo "ailedger: llm-usage-ledger skill not found — install the research-skills plugin, then run:" >&2
+echo "  python3 <skill dir>/llm_usage_ledger.py install" >&2
+exit 1
+"""
+
+
+def install_cli(bin_dir: Path = None) -> Path:
+    """Put an `ailedger` command on PATH (default ~/.local/bin). A copy run
+    from a plugin cache is NOT pinned (versioned dirs vanish on update — the
+    launcher finds the newest one); a copy run from a git clone IS preferred,
+    so a developer's working tree wins over an older installed plugin."""
+    skill = Path(__file__).resolve().parent
+    dev = "" if "/plugins/cache/" in str(skill) else str(skill)
+    bin_dir = Path(bin_dir or Path.home() / ".local" / "bin")
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    target = bin_dir / "ailedger"
+    if target.exists() and "ailedger launcher" not in target.read_text(errors="replace")[:300]:
+        backup = target.with_name("ailedger.bak")
+        target.replace(backup)
+        print(f"moved your existing {target} to {backup}")
+    target.write_text(_SHIM.replace("@@DEV@@", json.dumps(dev)))
+    target.chmod(0o755)
+    (skill / "bin" / "ailedger").chmod(0o755)
+    on_path = str(bin_dir) in os.environ.get("PATH", "").split(os.pathsep)
+    print(f"installed {target}" + (f" (prefers this clone: {dev})" if dev else ""))
+    print("try:  ailedger -h      then:  ailedger" if on_path else
+          f"add to PATH first:  echo 'export PATH=\"{bin_dir}:$PATH\"' >> ~/.zshrc && source ~/.zshrc")
+    return target
 
 
 # ------------------------------------------------------------- html report
@@ -1401,9 +1550,11 @@ def main(argv=None):
     p.add_argument("action", choices=["update", "list"],
                    help="update: fetch hosted rates for ledger models and "
                         "append dated entries; list: show the series")
+    p = sub.add_parser("install", help="put the `ailedger` command on your PATH (~/.local/bin)")
+    p.add_argument("--bin-dir", help="install somewhere other than ~/.local/bin")
     p = sub.add_parser("ingest", help="import subscription-tool usage "
                        "(flat-fee plans) into the ledger as derived events")
-    p.add_argument("tool", choices=["claude-code", "codex"])
+    p.add_argument("tool", choices=["claude-code", "codex", "lmstudio", "all"])
     p.add_argument("--refresh", action="store_true",
                    help="OPT-IN MIGRATION: re-derive rows already in the "
                         "ledger so fields added to the importer later (e.g. "
@@ -1453,10 +1604,15 @@ def main(argv=None):
                 for ts, pin, pout in rows:
                     print(f"{ts} {model:32s} in=${pin:<8g} out=${pout:g}")
         return 0
+    if a.cmd == "install":
+        install_cli(a.bin_dir)
+        return 0
     if a.cmd == "ingest":
-        if a.tool == "claude-code":
+        if a.tool in ("claude-code", "all"):
             ingest_claude_code(refresh=a.refresh)
-        else:
+        if a.tool in ("lmstudio", "all"):
+            ingest_lmstudio()
+        if a.tool == "codex":
             ingest_codex()
         return 0
     return 1
