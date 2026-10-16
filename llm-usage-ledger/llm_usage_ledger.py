@@ -35,6 +35,7 @@ import json
 import os
 import platform
 import re
+import statistics
 import subprocess
 import sys
 import threading
@@ -401,9 +402,14 @@ def print_report(by="project-model", windows=False, days=None):
 # `prices update` fetches the LiteLLM community price table (the same data
 # ccusage uses) and APPENDS today's entries — old entries are never edited,
 # and reports join as-of (latest entry dated <= the usage event). Open-weight
-# models are priced at their cheapest listed HOSTED rate: the honest
-# counterfactual "you could have rented this exact model for $X". Models
-# with no hosted listing fall back to the dated reference benchmark.
+# models are priced at the MEDIAN of their listed HOSTED rates: the honest
+# counterfactual "you could have rented this exact model for about $X".
+# (Median, not cheapest — one promo/outlier host moved the old number 3-10x.)
+# Usage that predates a model's first price entry is priced at that FIRST
+# entry (back-fill), never at the frontier reference. Local models with no
+# hosted listing at all use `reference-open` (median hosted rate of the open
+# models priced in the same update) — not the frontier benchmark, which
+# overstated local savings ~50x (2026-10-16).
 LITELLM_PRICES_URL = ("https://raw.githubusercontent.com/BerriAI/litellm/"
                       "main/model_prices_and_context_window.json")
 
@@ -438,7 +444,10 @@ def normalize_model_name(name: str) -> str:
 
 
 _PRECISION_SUFFIXES = ("-fp8", "-fp16", "-bf16", "-awq", "-int4", "-int8",
-                       "-quantized")
+                       "-quantized",
+                       # same weights, instruction-tuned release name
+                       # (gemma-4-e4b == gemma-4-e4b-it on hosts)
+                       "-it", "-instruct")
 
 
 def _same_model(target: str, key_norm: str) -> bool:
@@ -458,12 +467,13 @@ def _same_model(target: str, key_norm: str) -> bool:
 
 
 def match_price(model: str, table: dict):
-    """Cheapest hosted chat-mode rate for exactly `model` in a LiteLLM-shaped
-    table. Returns (input_per_m, output_per_m, matched_key) or None."""
+    """MEDIAN hosted chat-mode rate for exactly `model` in a LiteLLM-shaped
+    table (input and output medians taken separately). Returns
+    (input_per_m, output_per_m, description) or None."""
     target = normalize_model_name(model)
     if not target:
         return None
-    best = None
+    hits = []
     for key, info in table.items():
         if not isinstance(info, dict) or info.get("mode") not in (None, "chat"):
             continue
@@ -472,10 +482,20 @@ def match_price(model: str, table: dict):
         ci, co = info.get("input_cost_per_token"), info.get("output_cost_per_token")
         if not ci or not co:
             continue
-        cand = (ci * 1e6, co * 1e6, key)
-        if best is None or (cand[0] + cand[1]) < (best[0] + best[1]):
-            best = cand
-    return best
+        hits.append((ci * 1e6, co * 1e6, key))
+    if not hits:
+        return None
+    # Operator preference (2026-10-16): Azure's own listing when it exists
+    # (it is what the org would actually pay); otherwise the median across
+    # every host serving the same model.
+    azure = [h for h in hits if h[2].lower().startswith(("azure", "azure_ai"))]
+    if azure:
+        hits = azure
+    ins = sorted(h[0] for h in hits)
+    outs = sorted(h[1] for h in hits)
+    desc = (f"{'azure' if azure else 'median of'} {len(hits)} host(s), in ${ins[0]:g}-${ins[-1]:g} "
+            f"[{', '.join(sorted(h[2] for h in hits)[:4])}{', ...' if len(hits) > 4 else ''}]")
+    return statistics.median(ins), statistics.median(outs), desc
 
 
 def prices_update(models=None):
@@ -490,13 +510,27 @@ def prices_update(models=None):
                 "input_per_m": rates["input_per_m"],
                 "output_per_m": rates["output_per_m"],
                 "source": f"builtin:{CURRENT_RATE_KEY}"}]
+    local_models = {normalize_model_name(e.get("model", ""))
+                    for e in read_ledgers(scope="all") if is_local_event(e)}
+    open_rates = []
+    seen = set()
     for m in models:
+        if normalize_model_name(m) in seen:
+            continue  # 'mlx/gemma-4-e4b' and 'google/gemma-4-e4b' are one row
+        seen.add(normalize_model_name(m))
         hit = match_price(m, table)
         if hit:
             entries.append({"ts": today, "model": normalize_model_name(m),
                             "input_per_m": round(hit[0], 4),
                             "output_per_m": round(hit[1], 4),
                             "source": f"litellm:{hit[2]}"})
+            if normalize_model_name(m) in local_models:
+                open_rates.append(hit)
+    if open_rates:
+        entries.append({"ts": today, "model": "reference-open",
+                        "input_per_m": round(statistics.median(h[0] for h in open_rates), 4),
+                        "output_per_m": round(statistics.median(h[1] for h in open_rates), 4),
+                        "source": f"median of {len(open_rates)} priced local open model(s)"})
     with _write_lock:
         ledger_dir().mkdir(parents=True, exist_ok=True)
         with open(prices_file(), "a") as f:
@@ -524,15 +558,27 @@ def load_price_series() -> dict:
     return dict(series)
 
 
-def as_of_price(model: str, ts: str, series: dict):
-    """Latest price entry dated <= ts for model (else reference, else the
-    builtin table). Returns (in_per_m, out_per_m, source)."""
+def as_of_price(model: str, ts: str, series: dict, local: bool = False):
+    """Price for one event. Returns (in_per_m, out_per_m, source).
+
+    1. the model's latest entry dated <= ts;
+    2. else the model's FIRST entry (usage that predates its first price
+       record is back-filled at that price — it is the same model);
+    3. else, for LOCAL rows, `reference-open` (same as-of/back-fill rules);
+    4. else the frontier `reference` benchmark, else the builtin table.
+    """
     day = (ts or "")[:10]
-    for key, src in ((normalize_model_name(model), "model"),
-                     ("reference", "reference")):
-        rows = [r for r in series.get(key, []) if r[0] <= day] or None
-        if rows:
-            return rows[-1][1], rows[-1][2], src
+    keys = [(normalize_model_name(model), "model")]
+    if local:
+        keys.append(("reference-open", "reference-open"))
+    keys.append(("reference", "reference"))
+    for key, src in keys:
+        rows = series.get(key) or []
+        if not rows:
+            continue
+        dated = [r for r in rows if r[0] <= day]
+        r = dated[-1] if dated else rows[0]
+        return r[1], r[2], src
     rates = CLOUD_REFERENCE_RATES[CURRENT_RATE_KEY]
     return rates["input_per_m"], rates["output_per_m"], "builtin"
 
@@ -765,7 +811,7 @@ def _agg_rows(events, series):
         r["i"] += e["tin"]
         r["o"] += e["tout"]
         r["c"] += 1
-        pin, pout, _src = as_of_price(e["model"], e["ts"], series)
+        pin, pout, _src = as_of_price(e["model"], e["ts"], series, local=bool(e["local"]))
         # Anthropic-style cache economics: reads at 10% of input rate,
         # 5-minute cache writes at 1.25x, 1-hour writes at 2x.
         r["s"] += (e["tin"] / 1e6 * pin + e["tout"] / 1e6 * pout
@@ -1149,9 +1195,9 @@ def html_report(path, days=None, only_user=None):
     rows, granularity = _agg_rows(events, series)
 
     priced = {normalize_model_name(e["model"]) for e in events if e["local"]
-              and as_of_price(e["model"], e["ts"], series)[2] == "model"}
+              and as_of_price(e["model"], e["ts"], series, local=True)[2] == "model"}
     price_note = (f"per-model hosted rates for {len(priced)} local model(s), "
-                  "reference benchmark for the rest" if priced else
+                  "open-model median (reference-open) for unpriced local models" if priced else
                   "reference benchmark only — run `prices update` "
                   "for per-model hosted rates")
 

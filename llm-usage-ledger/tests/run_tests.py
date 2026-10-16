@@ -169,8 +169,8 @@ def run_suite():
                                     "input_cost_per_token": 2.9e-7,
                                     "output_cost_per_token": 5.9e-7}}
         hit = lp.match_price("Qwen3-32B-MLX-4bit", table)
-        check("cheapest_hosted_match", hit is not None
-              and abs(hit[0] - 0.29) < 1e-6 and "groq" in hit[2],
+        check("median_hosted_match", hit is not None
+              and abs(hit[0] - 0.345) < 1e-6 and "median of 2" in hit[2],
               f"got {hit!r}")
         table["azure/qwen3-32b-fp8"] = {"mode": "chat",
                                         "input_cost_per_token": 1e-7,
@@ -180,8 +180,16 @@ def run_suite():
                                  "output_cost_per_token": 4e-7}
         check("no_variant_overmatch",
               lp.match_price("gpt-5", table) is None  # nano is NOT gpt-5
+              # fp8 listing accepted as the same model; it is the only Azure
+              # listing, so Azure-preference picks it (0.1)
               and abs(lp.match_price("qwen3-32b", table)[0] - 0.1) < 1e-6,
               "prefix over-match not blocked or fp8 suffix not accepted")
+        az = lp.match_price("qwen3-32b", {
+            "together/qwen3-32b": {"mode": "chat", "input_cost_per_token": 4e-7, "output_cost_per_token": 1.2e-6},
+            "groq/qwen3-32b": {"mode": "chat", "input_cost_per_token": 2.9e-7, "output_cost_per_token": 5.9e-7},
+            "azure_ai/qwen3-32b": {"mode": "chat", "input_cost_per_token": 9e-7, "output_cost_per_token": 9e-7}})
+        check("azure_listing_preferred", az is not None and abs(az[0] - 0.9) < 1e-6
+              and az[2].startswith("azure"), f"got {az!r}")
         (Path(td) / "prices.jsonl").write_text(
             '{"ts":"2026-07-01","model":"qwen3-32b","input_per_m":0.40,"output_per_m":1.2,"source":"t"}\n'
             '{"ts":"2026-07-20","model":"qwen3-32b","input_per_m":0.29,"output_per_m":0.59,"source":"t"}\n'
@@ -193,6 +201,25 @@ def run_suite():
         check("as_of_join", early[0] == 0.40 and late[0] == 0.29
               and fall[2] == "reference",
               f"early={early} late={late} fall={fall}")
+        # back-fill: usage BEFORE a model's first price uses that first price,
+        # never the frontier reference (was ~50x too high, 2026-10-16)
+        before = lp.as_of_price("qwen3-32b", "2026-06-01T12:00:00", s)
+        check("backfill_first_price", before[0] == 0.40 and before[2] == "model",
+              f"before={before}")
+        (Path(td) / "prices.jsonl").write_text(
+            (Path(td) / "prices.jsonl").read_text()
+            + '{"ts":"2026-10-16","model":"reference-open","input_per_m":0.2,"output_per_m":1.0,"source":"t"}\n')
+        s = lp.load_price_series()
+        loc = lp.as_of_price("unknown-local", "2026-07-26T12:00:00", s, local=True)
+        cld = lp.as_of_price("unknown-cloud", "2026-07-26T12:00:00", s, local=False)
+        check("unpriced_local_uses_open_reference",
+              loc[0] == 0.2 and loc[2] == "reference-open"
+              and cld[0] == 2.5 and cld[2] == "reference",
+              f"local={loc} cloud={cld}")
+        (Path(td) / "prices.jsonl").write_text(
+            '{"ts":"2026-07-01","model":"qwen3-32b","input_per_m":0.40,"output_per_m":1.2,"source":"t"}\n'
+            '{"ts":"2026-07-20","model":"qwen3-32b","input_per_m":0.29,"output_per_m":0.59,"source":"t"}\n'
+            '{"ts":"2026-07-01","model":"reference","input_per_m":2.5,"output_per_m":10.0,"source":"t"}\n')
 
         # 8d. D2 — prices.jsonl lives in the ledger dir but is a PRICE series,
         # not usage. The scope="all" glob swept it in and counted every dated

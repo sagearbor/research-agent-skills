@@ -96,6 +96,13 @@ and is excluded from every read by name.
 | **5-minute cache writes** (`cache_w5_tokens`) | **1.25x the input rate** | Writes carry a premium, not a discount. |
 | **1-hour cache writes** (`cache_w1h_tokens`) | **2.0x the input rate** | Keep the TTL split the transcript provides; older records with a flat `cache_creation_input_tokens` are booked at the cheaper 5-minute premium, which understates rather than inflates. |
 
+## How local models are priced (2026-10-16)
+`prices update` fetches the LiteLLM community table (the same live data `npx ccusage` uses) and appends dated rows.
+For each model: **Azure's own listing if one exists**, else the **median across every host** serving that exact
+model (`-it`/`-instruct`/quant suffixes count as the same model). Usage older than a model's first price row is
+back-filled at that first row. A local model with no hosted listing uses `reference-open` (median of the local
+open models priced that day) — never the frontier `reference` benchmark, which overstated local savings ~50x.
+
 ## Where reports are written
 Never `$HOME`, never the cwd. `report --html` with no path writes to
 `~/.llm_token_ledger/reports/llm-spend.html` and prints a clickable `file://`
