@@ -630,7 +630,8 @@ def frontier_source(tier: str) -> str:
             f"${last['output_per_m']:g} per M, as of {last['ts']}")
 
 
-def as_of_price(model: str, ts: str, series: dict, local: bool = False):
+def as_of_price(model: str, ts: str, series: dict, local: bool = False,
+                pricing: str = None):
     """Price for one event. Returns (in_per_m, out_per_m, source).
 
     1. the model's latest entry dated <= ts;
@@ -640,9 +641,10 @@ def as_of_price(model: str, ts: str, series: dict, local: bool = False):
     4. else the frontier `reference` benchmark, else the builtin table.
     """
     day = (ts or "")[:10]
+    mode = pricing or LOCAL_PRICING
     keys = [(normalize_model_name(model), "model")]
-    if local and LOCAL_PRICING in FRONTIER_TIERS:
-        keys = [(f"frontier-{LOCAL_PRICING}", "frontier")]
+    if local and mode in FRONTIER_TIERS:
+        keys = [(f"frontier-{mode}", "frontier")]
     elif local:
         keys.append(("reference-open", "reference-open"))
     keys.append(("reference", "reference"))
@@ -881,11 +883,18 @@ def _agg_rows(events, series):
     for e in events:
         key = (e["ts"][:blen], e["model"], e["project"], bool(e["local"]),
                bool(e.get("sub")), e.get("machine", "?"), e.get("user", "?"))
-        r = agg.setdefault(key, {"i": 0, "o": 0, "c": 0, "s": 0.0})
+        r = agg.setdefault(key, {"i": 0, "o": 0, "c": 0, "s": 0.0, "S": {}})
         r["i"] += e["tin"]
         r["o"] += e["tout"]
         r["c"] += 1
-        pin, pout, _src = as_of_price(e["model"], e["ts"], series, local=bool(e["local"]))
+        pin, pout, _src = as_of_price(e["model"], e["ts"], series, local=bool(e["local"]),
+                                      pricing="same-model")
+        if e["local"]:
+            # Same tokens re-priced as each Claude tier, for the page's
+            # pricing dropdown (local rows only; no cache tokens locally).
+            for tier in FRONTIER_TIERS:
+                ti, to, _ = as_of_price(e["model"], e["ts"], series, local=True, pricing=tier)
+                r["S"][tier] = r["S"].get(tier, 0.0) + e["tin"] / 1e6 * ti + e["tout"] / 1e6 * to
         # Anthropic-style cache economics: reads at 10% of input rate,
         # 5-minute cache writes at 1.25x, 1-hour writes at 2x.
         r["s"] += (e["tin"] / 1e6 * pin + e["tout"] / 1e6 * pout
@@ -893,7 +902,8 @@ def _agg_rows(events, series):
                    + e.get("w5", 0) / 1e6 * pin * 1.25
                    + e.get("w1", 0) / 1e6 * pin * 2.0)
     rows = [{"b": b, "m": m, "p": p, "l": l, "u": u, "M": M, "U": U,
-             "i": r["i"], "o": r["o"], "c": r["c"], "s": round(r["s"], 4)}
+             "i": r["i"], "o": r["o"], "c": r["c"], "s": round(r["s"], 4),
+             **({"S": {k: round(v, 4) for k, v in r["S"].items()}} if r["S"] else {})}
             for (b, m, p, l, u, M, U), r in agg.items()]
     rows.sort(key=lambda r: r["b"])
     return rows, ("daily" if blen == 10 else "hourly")
@@ -928,15 +938,20 @@ table{border-collapse:collapse;font-size:.8rem}
 td{border:1px solid #e3e8ee;padding:3px 8px}
 summary{cursor:pointer;font-size:.85rem;margin-top:14px}
 .empty{color:#5b6b7b;font-size:.85rem;padding:18px 0}
+.pricetag{font-weight:600;color:#b4235a}
+.pricesel select{font:inherit;padding:2px 4px;margin-left:4px}
 #tt{position:absolute;background:#1c2733;color:#fff;padding:5px 9px;
  border-radius:6px;font-size:.75rem;pointer-events:none;display:none;
  z-index:9;line-height:1.5;white-space:nowrap;box-shadow:0 2px 8px #0004}
 </style></head><body>
-<h1>LLM usage ledger report</h1>
+<h1>LLM usage ledger report <span id="priceTag" class="pricetag"></span></h1>
 <div class="note">generated @@GENERATED@@ · ledger dir: ~/.llm_token_ledger
  (all *.jsonl usage writers merged; prices.jsonl is a price series, not usage,
  and is excluded) · @@SPAN@@@@IDNOTE@@</div>
 <div class="filters">
+ <label class="pricesel">Price local models as
+  <select id="priceSel">@@PRICEOPTS@@</select></label>
+ &nbsp;·&nbsp;
  <span class="scope" id="clsChips"><button data-c="local">Local</button><button data-c="cloud">Cloud</button><button data-c="sub">Subscription</button></span>
  &nbsp;·&nbsp;
  <span class="scope" id="metricChips"><button data-m="usd" class="on">$</button><button data-m="tok">tokens</button></span>
@@ -980,9 +995,13 @@ var UNATTR = "@@UNATTR@@";
 var visible = {local:true, cloud:true, sub:true};
 var machOn = null;   // null until built; map machine -> bool
 var metric = "usd", sel = null;   // sel === null -> all models
+var PRICES = @@PRICEMETA@@;
+var pricing = (location.hash.match(/price=([a-z-]+)/) || [])[1] || "@@PRICEDEFAULT@@";
+if (!PRICES[pricing]) pricing = "same-model";
+function cost(r){ return (r.l && pricing !== "same-model" && r.S) ? (r.S[pricing] || 0) : r.s; }
 var NS = "http://www.w3.org/2000/svg";
 function cls(r){ return r.u ? "sub" : (r.l ? "local" : "cloud"); }
-function val(r){ return metric === "usd" ? r.s : r.i + r.o; }
+function val(r){ return metric === "usd" ? cost(r) : r.i + r.o; }
 
 function fmt(n){ n = Math.round(n);
   return n >= 1e9 ? (n/1e9).toFixed(2)+"B" : n >= 1e6 ? (n/1e6).toFixed(1)+"M"
@@ -1031,11 +1050,12 @@ function modelTotals(rs){
 function tiles(rs){
   var calls=0, tin=0, tout=0, saved=0, spend=0, subv=0;
   rs.forEach(function(r){ calls += r.c; tin += r.i; tout += r.o;
-    if (r.u) subv += r.s; else if (r.l) saved += r.s; else spend += r.s; });
+    var v = cost(r);
+    if (r.u) subv += v; else if (r.l) saved += v; else spend += v; });
   var t = div("tiles");
   [["calls", calls.toLocaleString()],
    ["tokens in / out", fmt(tin) + " / " + fmt(tout)],
-   ["local cost avoided*", "$" + saved.toFixed(2)],
+   ["local cost avoided* (" + PRICES[pricing].short + ")", "$" + saved.toFixed(2)],
    ["cloud est. spend*", "$" + spend.toFixed(2)],
    ["subscription @ API rates*", "$" + subv.toFixed(2)],
    ["models shown", String(modelTotals(rs).length)]
@@ -1243,6 +1263,15 @@ document.querySelectorAll("#metricChips button").forEach(function(b){
   b.addEventListener("click", function(){
     metric = b.getAttribute("data-m") === "usd" ? "usd" : "tok";
     render(); }); });
+function applyPricing(){
+  var p = PRICES[pricing];
+  document.getElementById("priceTag").textContent = "(" + p.title + ")";
+  document.title = "LLM usage ledger — " + p.short;
+  document.getElementById("priceSel").value = pricing;
+  try { history.replaceState(null, "", "#price=" + pricing); } catch(e) {} }
+document.getElementById("priceSel").addEventListener("change", function(e){
+  pricing = e.target.value; applyPricing(); render(); });
+applyPricing();
 render();
 })();
 </script>
@@ -1270,16 +1299,12 @@ def html_report(path, days=None, only_user=None):
 
     priced = {normalize_model_name(e["model"]) for e in events if e["local"]
               and as_of_price(e["model"], e["ts"], series, local=True)[2] == "model"}
-    if LOCAL_PRICING in FRONTIER_TIERS:
-        src = frontier_source(LOCAL_PRICING)
-        price_note = (f"LOCAL ROWS PRICED AS CLAUDE {LOCAL_PRICING.upper()} ({src}) — the "
-                      "'had this work run on that Claude model instead' counterfactual; the "
-                      "default view prices them as the same open model rented")
-    else:
-      price_note = (f"per-model hosted rates for {len(priced)} local model(s), "
-                    "open-model median (reference-open) for unpriced local models" if priced else
-                    "reference benchmark only — run `prices update` "
-                    "for per-model hosted rates")
+    price_note = (f"default view: per-model hosted rates for {len(priced)} local model(s), "
+                  "open-model median (reference-open) for unpriced local models; the "
+                  "'Price local models as' menu re-prices local rows as a Claude tier "
+                  "(shown in the title)" if priced else
+                  "reference benchmark only — run `prices update` "
+                  "for per-model hosted rates")
 
     # Static, JS-independent fallback table over ALL models.
     by_model = {}
@@ -1310,6 +1335,17 @@ def html_report(path, days=None, only_user=None):
 
     data_json = json.dumps({"rows": rows, "granularity": granularity}
                            ).replace("</", "<\\/")
+    meta = {"same-model": {"title": "local models priced at same-model cloud rental — most realistic",
+                           "short": "same-model rental",
+                           "label": "Same model rented in the cloud (most realistic)"}}
+    for tier in FRONTIER_TIERS:
+        src = frontier_source(tier)
+        meta[tier] = {"title": f"local models priced at Claude {tier.capitalize()} replacement cost — {src}",
+                      "short": f"as Claude {tier.capitalize()}",
+                      "label": f"Claude {tier.capitalize()} replacement — {src}"}
+    opts = "".join(f'<option value="{k}">{escape_html(v["label"])}</option>' for k, v in meta.items())
+    meta_json = json.dumps({k: {"title": v["title"], "short": v["short"]} for k, v in meta.items()}
+                           ).replace("</", "<\\/")
     html = (_HTML_TEMPLATE
             .replace("@@GENERATED@@", datetime.datetime.now().astimezone()
                      .isoformat(timespec="minutes"))
@@ -1318,6 +1354,9 @@ def html_report(path, days=None, only_user=None):
             .replace("@@UNATTR@@", UNATTRIBUTED)
             .replace("@@TABLE@@", table)
             .replace("@@PRICENOTE@@", escape_html(price_note))
+            .replace("@@PRICEOPTS@@", opts)
+            .replace("@@PRICEMETA@@", meta_json)
+            .replace("@@PRICEDEFAULT@@", LOCAL_PRICING if LOCAL_PRICING in meta else "same-model")
             .replace("@@DATA@@", data_json))
     Path(path).write_text(html)
     n_local = sum(1 for e in events if e["local"])
@@ -1354,7 +1393,7 @@ def main(argv=None):
                    help="price local-model rows as the SAME open model rented in the cloud "
                         "(default), or as a Claude tier haiku|sonnet|opus|fable (newest model of "
                         "that family in the live price table; 'frontier' = sonnet). "
-                        "HTML defaults to llm-spend-<tier>.html")
+                        "With --html this just preselects the page's pricing menu.")
     p.add_argument("--html", nargs="?", const="__DEFAULT__",
                    metavar="PATH", help="write a self-contained graphical "
                    "HTML report (charts over the whole ledger dir) to PATH")
@@ -1378,8 +1417,7 @@ def main(argv=None):
         LOCAL_PRICING = (DEFAULT_FRONTIER_TIER if a.local_as == "frontier"
                          else a.local_as)
         if a.html == "__DEFAULT__":
-            a.html = str(default_report_path() if LOCAL_PRICING == "same-model"
-                         else reports_dir() / f"llm-spend-{LOCAL_PRICING}.html")
+            a.html = str(default_report_path())  # one page; --local-as only preselects the menu
         if a.html:
             # Shared dir => default to just you. Local dir is already just you,
             # so the flag is a no-op there and nobody has to think about it.
