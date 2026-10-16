@@ -30,10 +30,12 @@ CLI:
 import argparse
 import datetime
 import getpass
+import hashlib
 import json
 import os
 import platform
 import re
+import statistics
 import subprocess
 import sys
 import threading
@@ -44,6 +46,23 @@ from pathlib import Path
 
 SCHEMA_VERSION = 1
 _write_lock = threading.Lock()
+
+# Sentinel for "this record's writer did not record who/where". It is a VALUE,
+# never a guess: reading someone else's file must never mint an identity for
+# it. See _normalize() — defaulting to the reader's own name credited 22,229
+# foreign rows to whoever happened to open the dashboard.
+UNATTRIBUTED = "unattributed"
+
+# Prefix for a working directory with no git remote. Deliberately NOT a
+# filesystem path: a path leaks the local username into a shared ledger and
+# still joins with nobody. The 12-hex suffix keeps two scratch dirs on one
+# machine distinguishable without being readable.
+NO_REMOTE = "no-remote"
+
+# Files that live in the ledger dir but are NOT usage events. Excluded by
+# NAME, not by sniffing fields — a heuristic would silently start or stop
+# dropping rows as the schema evolves.
+NON_USAGE_FILES = frozenset({"prices.jsonl"})
 
 # Reference cloud rates for savings estimates ($/1M tokens). Versioned +
 # dated so historical reports stay reproducible: add entries, never edit.
@@ -74,24 +93,72 @@ def machine_name() -> str:
             or platform.node().split(".")[0] or "unknown")
 
 
+def canonical_repo_key(url: str) -> str:
+    """Any remote spelling -> 'host/org/name'. Returns "" for empty input.
+
+    The same repository is cloned as `git@github.com:Org/Repo.git` by one
+    developer and `https://github.com/org/repo` by the next. Lower-casing and
+    stripping `.git` (what this used to do) leaves those as two DIFFERENT
+    strings, so the cross-developer join splits in half without any error —
+    the worst kind of failure, because both halves look like valid totals.
+    Canonicalising to host/org/name collapses them onto one key.
+
+    Handled: scp-style (`git@host:org/repo`), any scheme://, embedded
+    credentials (`https://user:token@host/...`), a non-default port, a
+    trailing `.git` or `/`, and case.
+    """
+    u = (url or "").strip()
+    if not u:
+        return ""
+    u = re.sub(r"\.git/*$", "", u).rstrip("/")
+    m = re.match(r"^([A-Za-z][A-Za-z0-9+.\-]*)://(.*)$", u)
+    if m:                                    # scheme://[user[:pw]@]host[:port]/path
+        scheme, rest = m.group(1).lower(), m.group(2)
+        head, sep, tail = rest.partition("/")
+        if "@" in head:                      # drop embedded credentials
+            head = head.rsplit("@", 1)[-1]
+        if scheme == "file" or not head:     # file:///srv/git/repo
+            host, path = "local", rest
+        else:
+            host, path = head.split(":")[0], tail
+    elif re.match(r"^(?:[^/@]+@)?[^/:]+:", u):   # git@github.com:org/repo
+        hostpart, _, path = u.partition(":")
+        host = hostpart.rsplit("@", 1)[-1]
+    else:                                    # bare path remote (/srv/git/repo)
+        host, path = "local", u
+    return f"{host.strip('/')}/{path.strip('/')}".strip("/").lower()
+
+
+def unjoinable_repo_key(cwd: str = ".") -> str:
+    """Explicit marker for 'this directory has no remote, so nothing can ever
+    join to it'. The old fallback was "path:" + the absolute path, which put
+    /home/USER/... into every shared record — an identity leak that
+    bought nothing, since a local path joins across developers exactly never.
+    A digest of the path keeps two scratch dirs apart without naming anyone."""
+    h = hashlib.sha256(str(Path(cwd).resolve()).encode("utf-8")).hexdigest()
+    return f"{NO_REMOTE}:{h[:12]}"
+
+
 def repo_remote_key(cwd: str = ".") -> str:
     """Identity that is the SAME for every developer on a repo.
 
     detect_project() returns the local folder name, so two people who clone the
     same repo into differently-named directories log different projects and
-    their spend never adds up. The git remote URL is identical on every clone on
-    every machine, so it is the join key. Falls back to a path for scratch dirs
-    with no remote.
+    their spend never adds up. The canonicalised git remote is identical on
+    every clone on every machine, so it is the join key. With no remote you get
+    an explicit unjoinable marker, never a path.
     """
     try:
         r = subprocess.run(["git", "-C", cwd, "remote", "get-url", "origin"],
                            capture_output=True, text=True, timeout=5)
         url = (r.stdout or "").strip()
         if r.returncode == 0 and url:
-            return re.sub(r"\.git$", "", url.lower())
+            key = canonical_repo_key(url)
+            if key:
+                return key
     except (OSError, subprocess.SubprocessError):
         pass
-    return "path:" + str(Path(cwd).resolve())
+    return unjoinable_repo_key(cwd)
 
 
 def project_registry() -> dict:
@@ -104,11 +171,25 @@ def project_registry() -> dict:
         return {}
 
 
+def registry_lookup(key: str) -> dict:
+    """Registry record for a canonical repo key, tolerating the RAW remote-url
+    keys agent-coach has already written (`git@github.com:org/repo`). Without
+    this, canonicalising the key would silently orphan every d1 tag anyone has
+    set so far — a fix that quietly deletes data is not a fix."""
+    reg = project_registry()
+    if key in reg:
+        return reg[key] or {}
+    for k, v in reg.items():
+        if canonical_repo_key(str(k)) == key:
+            return v or {}
+    return {}
+
+
 def project_tag(cwd: str = ".") -> dict:
     """(project, d1, repo) for cwd. `d1` is the institutional code when the repo
     has been registered; None for a POC or an untagged repo — never invented."""
     key = repo_remote_key(cwd)
-    rec = project_registry().get(key) or {}
+    rec = registry_lookup(key)
     return {"repo": key,
             "project": rec.get("project") or detect_project(cwd),
             "d1": rec.get("d1")}
@@ -182,14 +263,38 @@ def _normalize(e: dict) -> dict:
         return {"schema": e.get("schema"), "ts": e.get("ts", ""),
                 "duration_s": e.get("duration_s"),
                 "provider": e.get("provider", "?"),
-                "machine": e.get("machine", machine_name()),
-                "user": e.get("user", whoami()),
+                # NEVER whoami()/machine_name() here. This function reads
+                # OTHER people's files; inferring identity from the reader
+                # credited every foreign row to whoever ran the report.
+                "machine": e.get("machine") or UNATTRIBUTED,
+                "user": e.get("user") or UNATTRIBUTED,
                 "project": e.get("project", "?"), "model": e.get("model", "?"),
                 "prompt_tokens": e.get("tokens_in") or 0,
                 "completion_tokens": e.get("tokens_out") or 0,
                 "reasoning_tokens": e.get("reasoning_tokens"),
-                "task_tag": e.get("task_tag")}
-    return e
+                "task_tag": e.get("task_tag"),
+                # pass through only when the foreign writer actually set them —
+                # an absent join key must stay absent, not become ""
+                **{k: e[k] for k in ("repo", "d1") if e.get(k)}}
+    # Same rule for the skill's own schema: a row that never recorded who or
+    # where gets the sentinel, not the reader and not a bare "?" that reads
+    # like a parse failure. Read-time only — nothing on disk is rewritten.
+    fill = {k: UNATTRIBUTED for k in ("user", "machine") if not e.get(k)}
+    return {**e, **fill} if fill else e
+
+
+# Flat-fee plan usage. `ingest` rows carry subscription=true; pipelines that
+# shell out to `claude -p` / `codex exec` mark it with endpoint_host
+# "subscription" instead (llm-as-judge token_ledger). Both are plan usage —
+# booking the second as cloud showed $651 of phantom "cloud spend" on
+# 2026-10-14 that was really the Max and ChatGPT plans (2026-10-16).
+SUBSCRIPTION_PROVIDERS = frozenset({"claude-cli", "codex-cli", "claude-code", "codex"})
+
+
+def is_subscription_event(e: dict) -> bool:
+    return bool(e.get("subscription")
+                or e.get("endpoint_host") == "subscription"
+                or e.get("provider") in SUBSCRIPTION_PROVIDERS)
 
 
 def is_local_event(e: dict) -> bool:
@@ -209,6 +314,12 @@ def read_ledgers(days: float = None, scope: str = "skill"):
                   - datetime.timedelta(days=days))
     pattern = "*.jsonl" if scope == "all" else "lmstudio-*.jsonl"
     for path in sorted(ledger_dir().glob(pattern)):
+        # prices.jsonl is a dated PRICE series that happens to share the
+        # directory and the extension. Swept in by the glob, its rows parse
+        # cleanly, carry a `ts`, and count as zero-token calls — inflating the
+        # call count and inventing an identity-less phantom row per price.
+        if path.name in NON_USAGE_FILES:
+            continue
         for line in path.read_text().splitlines():
             if not line.strip():
                 continue
@@ -305,9 +416,14 @@ def print_report(by="project-model", windows=False, days=None):
 # `prices update` fetches the LiteLLM community price table (the same data
 # ccusage uses) and APPENDS today's entries — old entries are never edited,
 # and reports join as-of (latest entry dated <= the usage event). Open-weight
-# models are priced at their cheapest listed HOSTED rate: the honest
-# counterfactual "you could have rented this exact model for $X". Models
-# with no hosted listing fall back to the dated reference benchmark.
+# models are priced at the MEDIAN of their listed HOSTED rates: the honest
+# counterfactual "you could have rented this exact model for about $X".
+# (Median, not cheapest — one promo/outlier host moved the old number 3-10x.)
+# Usage that predates a model's first price entry is priced at that FIRST
+# entry (back-fill), never at the frontier reference. Local models with no
+# hosted listing at all use `reference-open` (median hosted rate of the open
+# models priced in the same update) — not the frontier benchmark, which
+# overstated local savings ~50x (2026-10-16).
 LITELLM_PRICES_URL = ("https://raw.githubusercontent.com/BerriAI/litellm/"
                       "main/model_prices_and_context_window.json")
 
@@ -342,7 +458,10 @@ def normalize_model_name(name: str) -> str:
 
 
 _PRECISION_SUFFIXES = ("-fp8", "-fp16", "-bf16", "-awq", "-int4", "-int8",
-                       "-quantized")
+                       "-quantized",
+                       # same weights, instruction-tuned release name
+                       # (gemma-4-e4b == gemma-4-e4b-it on hosts)
+                       "-it", "-instruct")
 
 
 def _same_model(target: str, key_norm: str) -> bool:
@@ -362,12 +481,13 @@ def _same_model(target: str, key_norm: str) -> bool:
 
 
 def match_price(model: str, table: dict):
-    """Cheapest hosted chat-mode rate for exactly `model` in a LiteLLM-shaped
-    table. Returns (input_per_m, output_per_m, matched_key) or None."""
+    """MEDIAN hosted chat-mode rate for exactly `model` in a LiteLLM-shaped
+    table (input and output medians taken separately). Returns
+    (input_per_m, output_per_m, description) or None."""
     target = normalize_model_name(model)
     if not target:
         return None
-    best = None
+    hits = []
     for key, info in table.items():
         if not isinstance(info, dict) or info.get("mode") not in (None, "chat"):
             continue
@@ -376,10 +496,20 @@ def match_price(model: str, table: dict):
         ci, co = info.get("input_cost_per_token"), info.get("output_cost_per_token")
         if not ci or not co:
             continue
-        cand = (ci * 1e6, co * 1e6, key)
-        if best is None or (cand[0] + cand[1]) < (best[0] + best[1]):
-            best = cand
-    return best
+        hits.append((ci * 1e6, co * 1e6, key))
+    if not hits:
+        return None
+    # Operator preference (2026-10-16): Azure's own listing when it exists
+    # (it is what the org would actually pay); otherwise the median across
+    # every host serving the same model.
+    azure = [h for h in hits if h[2].lower().startswith(("azure", "azure_ai"))]
+    if azure:
+        hits = azure
+    ins = sorted(h[0] for h in hits)
+    outs = sorted(h[1] for h in hits)
+    desc = (f"{'azure' if azure else 'median of'} {len(hits)} host(s), in ${ins[0]:g}-${ins[-1]:g} "
+            f"[{', '.join(sorted(h[2] for h in hits)[:4])}{', ...' if len(hits) > 4 else ''}]")
+    return statistics.median(ins), statistics.median(outs), desc
 
 
 def prices_update(models=None):
@@ -394,13 +524,34 @@ def prices_update(models=None):
                 "input_per_m": rates["input_per_m"],
                 "output_per_m": rates["output_per_m"],
                 "source": f"builtin:{CURRENT_RATE_KEY}"}]
+    local_models = {normalize_model_name(e.get("model", ""))
+                    for e in read_ledgers(scope="all") if is_local_event(e)}
+    open_rates = []
+    seen = set()
     for m in models:
+        if normalize_model_name(m) in seen:
+            continue  # 'mlx/gemma-4-e4b' and 'google/gemma-4-e4b' are one row
+        seen.add(normalize_model_name(m))
         hit = match_price(m, table)
         if hit:
             entries.append({"ts": today, "model": normalize_model_name(m),
                             "input_per_m": round(hit[0], 4),
                             "output_per_m": round(hit[1], 4),
                             "source": f"litellm:{hit[2]}"})
+            if normalize_model_name(m) in local_models:
+                open_rates.append(hit)
+    for tier in FRONTIER_TIERS:
+        hit = newest_claude(table, tier)
+        if hit:
+            entries.append({"ts": today, "model": f"frontier-{tier}",
+                            "input_per_m": round(hit[0], 4),
+                            "output_per_m": round(hit[1], 4),
+                            "source": f"litellm:{hit[2]}"})
+    if open_rates:
+        entries.append({"ts": today, "model": "reference-open",
+                        "input_per_m": round(statistics.median(h[0] for h in open_rates), 4),
+                        "output_per_m": round(statistics.median(h[1] for h in open_rates), 4),
+                        "source": f"median of {len(open_rates)} priced local open model(s)"})
     with _write_lock:
         ledger_dir().mkdir(parents=True, exist_ok=True)
         with open(prices_file(), "a") as f:
@@ -428,15 +579,82 @@ def load_price_series() -> dict:
     return dict(series)
 
 
-def as_of_price(model: str, ts: str, series: dict):
-    """Latest price entry dated <= ts for model (else reference, else the
-    builtin table). Returns (in_per_m, out_per_m, source)."""
+# How local rows are priced: "same-model" (default — renting the same open
+# model in the cloud) or a Claude tier "haiku" | "sonnet" | "opus" | "fable"
+# (counterfactual "had this work run on that Claude model instead"). Tier
+# prices are dated `frontier-<tier>` rows appended by `prices update`, taken
+# from the NEWEST claude-<tier>-X-Y listed in the live table, so the model is
+# named and checkable. Set by `report --local-as` (operator choice 2026-10-16:
+# the org standardised on Claude Code, so Claude is the reference family).
+FRONTIER_TIERS = ("haiku", "sonnet", "opus", "fable")
+DEFAULT_FRONTIER_TIER = "sonnet"
+LOCAL_PRICING = "same-model"
+
+
+def newest_claude(table: dict, family: str):
+    """(input_per_m, output_per_m, key) for the highest-versioned
+    first-party `claude-<family>-X[-Y]` entry, or None."""
+    best = None
+    for key, info in table.items():
+        m = re.fullmatch(rf"claude-{family}-(\d+)(?:-(\d+))?", key)
+        if not m or not isinstance(info, dict):
+            continue
+        ci, co = info.get("input_cost_per_token"), info.get("output_cost_per_token")
+        if not ci or not co:
+            continue
+        ver = (int(m.group(1)), int(m.group(2) or 0))
+        if len(m.group(2) or "") >= 8:  # dated snapshot, not a version
+            ver = (int(m.group(1)), 0)
+        if best is None or ver > best[0]:
+            best = (ver, ci * 1e6, co * 1e6, key)
+    return best and best[1:]
+
+
+def frontier_source(tier: str) -> str:
+    """'claude-sonnet-5-5 $2/$10 per M, as of 2026-10-16' from the latest
+    frontier-<tier> price row (falls back to the reference benchmark)."""
+    last = None
+    if prices_file().exists():
+        for line in prices_file().read_text().splitlines():
+            try:
+                e = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if e.get("model") == f"frontier-{tier}":
+                last = e
+    if not last:
+        r = CLOUD_REFERENCE_RATES[CURRENT_RATE_KEY]
+        return (f"no frontier-{tier} price yet — run `prices update`; using reference "
+                f"${r['input_per_m']:g}/${r['output_per_m']:g} per M")
+    return (f"{last['source'].removeprefix('litellm:')} ${last['input_per_m']:g}/"
+            f"${last['output_per_m']:g} per M, as of {last['ts']}")
+
+
+def as_of_price(model: str, ts: str, series: dict, local: bool = False,
+                pricing: str = None):
+    """Price for one event. Returns (in_per_m, out_per_m, source).
+
+    1. the model's latest entry dated <= ts;
+    2. else the model's FIRST entry (usage that predates its first price
+       record is back-filled at that price — it is the same model);
+    3. else, for LOCAL rows, `reference-open` (same as-of/back-fill rules);
+    4. else the frontier `reference` benchmark, else the builtin table.
+    """
     day = (ts or "")[:10]
-    for key, src in ((normalize_model_name(model), "model"),
-                     ("reference", "reference")):
-        rows = [r for r in series.get(key, []) if r[0] <= day] or None
-        if rows:
-            return rows[-1][1], rows[-1][2], src
+    mode = pricing or LOCAL_PRICING
+    keys = [(normalize_model_name(model), "model")]
+    if local and mode in FRONTIER_TIERS:
+        keys = [(f"frontier-{mode}", "frontier")]
+    elif local:
+        keys.append(("reference-open", "reference-open"))
+    keys.append(("reference", "reference"))
+    for key, src in keys:
+        rows = series.get(key) or []
+        if not rows:
+            continue
+        dated = [r for r in rows if r[0] <= day]
+        r = dated[-1] if dated else rows[0]
+        return r[1], r[2], src
     rates = CLOUD_REFERENCE_RATES[CURRENT_RATE_KEY]
     return rates["input_per_m"], rates["output_per_m"], "builtin"
 
@@ -450,25 +668,76 @@ def as_of_price(model: str, ts: str, series: dict):
 # ingested survives the tool's own transcript pruning. Records carry
 # subscription=true: reports price them at API rates as "what the plan
 # absorbed", never mixed into local savings or cloud spend.
-INGEST_CONTACT = "sage.arbor@duke.edu"
+def ingest_contact() -> str:
+    """Where an importer bug gets reported. Env-overridable, and the default
+    names a ROLE, not a person: a personal address compiled into a skill that
+    other organisations install routes their bug reports to one individual
+    forever, including after that person changes jobs."""
+    return os.environ.get("LLM_LEDGER_SUPPORT_CONTACT") or (
+        "your llm-usage-ledger maintainer (set LLM_LEDGER_SUPPORT_CONTACT "
+        "to route these reports)")
 
 
 def _ingest_derived_file(tool: str) -> Path:
     return ledger_dir() / f"{tool}-{whoami()}-{machine_name()}.jsonl"
 
 
-def _ingest_error(tool: str, n_errors: int, sample: str):
+def line_shape(line: str, exc: BaseException) -> str:
+    """A description of an unparsed line that contains NO part of the line.
+
+    The ledger's whole claim to being installable org-wide is
+    counts-never-content: it records how many tokens, never what was said.
+    Writing 400 raw characters of a transcript into a log — and then asking a
+    colleague to email that log — breaks the invariant in the one code path
+    where nobody is looking. What a maintainer actually needs to fix an
+    importer is the SHAPE: how long, which field, which error, and a digest to
+    tell two distinct failures apart.
+    """
+    digest = hashlib.sha256(line.encode("utf-8", "replace")).hexdigest()[:16]
+    field = "<line-is-not-json>"
+    try:
+        d = json.loads(line)
+    except Exception:
+        d = None
+    if isinstance(d, dict):
+        msg = d.get("message")
+        if not isinstance(msg, dict):
+            field = "message"
+        elif not isinstance(msg.get("usage"), dict):
+            field = "message.usage"
+        elif not d.get("timestamp"):
+            field = "timestamp"
+        else:
+            field = "|".join(sorted(d.keys()))[:120]   # key NAMES only
+    elif d is not None:
+        field = f"<json-{type(d).__name__}>"
+    return (f"err={type(exc).__name__} field={field} len={len(line)} "
+            f"sha256={digest}")
+
+
+def _ingest_error(tool: str, n_errors: int, shape: str):
+    """`shape` MUST come from line_shape() — never a slice of the line."""
     log = ledger_dir() / f"ingest-errors-{tool}.log"
     with open(log, "a") as f:
         f.write(f"{datetime.datetime.now().isoformat(timespec='seconds')} "
-                f"{n_errors} unparsed lines; sample: {sample[:400]}\n")
-    print(f"ingest {tool}: {n_errors} lines not understood — logged to {log}."
-          f"\nPlease email that file to {INGEST_CONTACT} so the importer "
-          f"can be fixed.", file=sys.stderr)
+                f"{n_errors} unparsed lines; first shape: {shape}\n")
+    print(f"ingest {tool}: {n_errors} lines not understood — their SHAPE "
+          f"(length, failing field, digest — never their content) is logged "
+          f"to {log}.\nAttach that log when reporting this to "
+          f"{ingest_contact()} so the importer can be fixed.", file=sys.stderr)
 
 
-def ingest_claude_code():
-    """Derive subscription-usage events from Claude Code transcripts."""
+def ingest_claude_code(refresh: bool = False):
+    """Derive subscription-usage events from Claude Code transcripts.
+
+    refresh=True re-derives records that were already ingested, so fields added
+    to the importer later (notably `repo`, the cross-developer join key) reach
+    rows imported before that field existed. It is OPT-IN — `ingest claude-code
+    --refresh` — because it rewrites existing ledger rows, and a tool that
+    silently rewrites your accounting history is not one you can audit. The
+    default path still skips anything already seen, so a plain re-ingest can
+    never duplicate or mutate.
+    """
     src = Path.home() / ".claude" / "projects"
     if not src.is_dir():
         print("ingest claude-code: no ~/.claude/projects found — nothing to do")
@@ -482,8 +751,11 @@ def ingest_claude_code():
                 existing[e.get("src_id")] = e
             except json.JSONDecodeError:
                 continue
-    n_new = n_err = 0
-    sample_err = ""
+    n_new = n_err = n_refreshed = 0
+    shape_err = ""
+    # one git call per distinct cwd, not per record: 24k records span a few
+    # dozen directories, and `git remote get-url` per row would take minutes
+    tag_cache = {}
     for f in src.glob("*/*.jsonl"):
         for line in f.read_text(errors="replace").splitlines():
             if '"usage"' not in line:
@@ -507,32 +779,164 @@ def ingest_claude_code():
                 if not (tin or tout or cr or w5 or w1h):
                     continue
                 sid = d.get("uuid") or f"{f.name}:{d.get('timestamp')}"
-                if sid in existing:
+                seen = sid in existing
+                if seen and not refresh:
                     continue
                 cwd = d.get("cwd") or ""
-                existing[sid] = {
+                # `project` is the local folder name and differs per developer;
+                # `repo` is the join key SKILL.md documents and was empty on
+                # every row this importer had ever written. `d1` comes from the
+                # shared registry or stays absent — never invented. The cwd
+                # itself is NOT stored: it contains the local username.
+                tag = tag_cache.get(cwd)
+                if tag is None:
+                    tag = (project_tag(cwd) if cwd and Path(cwd).is_dir()
+                           else {"repo": unjoinable_repo_key(cwd) if cwd
+                                 else f"{NO_REMOTE}:unknown-cwd",
+                                 "project": Path(cwd).name if cwd
+                                 else f.parent.name, "d1": None})
+                    tag_cache[cwd] = tag
+                rec = {
                     "schema": SCHEMA_VERSION, "src_id": sid,
                     "ts": (d.get("timestamp") or "").replace("Z", "+00:00"),
                     "provider": "claude-code", "subscription": True,
                     "machine": machine_name(), "user": whoami(),
-                    "project": Path(cwd).name if cwd else f.parent.name,
+                    "project": (Path(cwd).name if cwd else f.parent.name),
+                    "repo": tag["repo"],
                     "model": msg.get("model") or "claude-unknown",
                     "prompt_tokens": tin, "completion_tokens": tout,
                     "cache_read_tokens": cr, "cache_w5_tokens": w5,
                     "cache_w1h_tokens": w1h, "task_tag": "claude-code"}
-                n_new += 1
+                if tag.get("d1"):
+                    rec["d1"] = tag["d1"]
+                existing[sid] = rec
+                if seen:
+                    n_refreshed += 1
+                else:
+                    n_new += 1
             except Exception as e:
                 n_err += 1
-                sample_err = sample_err or f"{e!r}: {line[:200]}"
+                # SHAPE ONLY — see line_shape(). Never `line[:N]`.
+                shape_err = shape_err or line_shape(line, e)
     with _write_lock:
         ledger_dir().mkdir(parents=True, exist_ok=True)
         with open(out, "w") as fh:
             for e in existing.values():
                 fh.write(json.dumps(e) + "\n")
-    print(f"ingest claude-code: {n_new} new events, {len(existing)} total "
-          f"-> {out}")
+    print(f"ingest claude-code: {n_new} new events, "
+          + (f"{n_refreshed} re-derived, " if refresh else "")
+          + f"{len(existing)} total -> {out}")
     if n_err:
-        _ingest_error("claude-code", n_err, sample_err)
+        _ingest_error("claude-code", n_err, shape_err)
+
+
+_LMS_PRED = re.compile(r"^\[(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d)\]\[INFO\]\[[^\]]*\] "
+                       r"Generated prediction: \{\s*$")
+LMSTUDIO_TAG = "lmstudio-log"
+
+
+def lmstudio_log_dir() -> Path:
+    return Path(os.environ.get("LMSTUDIO_LOG_DIR")
+                or Path.home() / ".lmstudio" / "server-logs")
+
+
+def _lmstudio_predictions(path: Path):
+    """Yield (ts_naive_str, prediction_dict) for every completed request in an
+    LM Studio server log. The block is a pretty-printed OpenAI response that
+    starts on the `Generated prediction: {` line and ends at a bare `}`. Only
+    id/model/usage are used; message content is parsed and dropped."""
+    buf, ts = None, None
+    with open(path, encoding="utf-8", errors="replace") as fh:
+        for line in fh:
+            if buf is None:
+                m = _LMS_PRED.match(line)
+                if m:
+                    buf, ts = ["{"], m.group(1)
+                continue
+            buf.append(line)
+            if line.rstrip("\n") == "}":
+                text = "".join(buf)
+                buf = None
+                try:
+                    yield ts, json.loads(text)
+                except json.JSONDecodeError as e:
+                    digest = hashlib.sha256(text.encode("utf-8", "replace")).hexdigest()[:16]
+                    yield ts, {"_error": f"err={type(e).__name__} len={len(text)} sha256={digest}"}
+
+
+def ingest_lmstudio():
+    """Import local-model usage from LM Studio's own server logs
+    (~/.lmstudio/server-logs, override LMSTUDIO_LOG_DIR), so anyone running
+    LM Studio's server gets local savings with NO code changes. Idempotent
+    (merged by the response id). Requests your own code already logged via
+    log_usage()/another ledger writer (same model + exact token counts within
+    15 minutes) are skipped, so nothing is counted twice. Counts only: the
+    prompt and answer text in the log are never copied. LM Studio's chat
+    window is not covered — only requests to its local server (API)."""
+    src = lmstudio_log_dir()
+    if not src.is_dir():
+        print(f"ingest lmstudio: no LM Studio server logs at {src} — nothing to do")
+        return
+    out = _ingest_derived_file(LMSTUDIO_TAG)
+    existing = {}
+    if out.exists():
+        for line in out.read_text().splitlines():
+            try:
+                e = json.loads(line)
+                existing[e["src_id"]] = e
+            except (json.JSONDecodeError, KeyError):
+                continue
+    # Already-logged local calls from other writers: (model, tin, tout) -> [epoch...]
+    logged = defaultdict(list)
+    for e in read_ledgers(scope="all"):
+        if e.get("task_tag") == LMSTUDIO_TAG or not is_local_event(e):
+            continue
+        try:
+            t = datetime.datetime.fromisoformat(e["ts"]).timestamp()
+        except (KeyError, ValueError, TypeError):
+            continue
+        logged[(normalize_model_name(e.get("model", "")), e.get("prompt_tokens"),
+                e.get("completion_tokens"))].append(t)
+    n_new = n_dup = n_err = 0
+    first_err = None
+    for f in sorted(src.rglob("*.log")):
+        for ts, d in _lmstudio_predictions(f):
+            if "_error" in d:
+                n_err += 1
+                first_err = first_err or d["_error"]
+                continue
+            u = d.get("usage") or {}
+            rid = d.get("id")
+            if not rid or not isinstance(u, dict) or u.get("prompt_tokens") is None:
+                continue
+            if rid in existing:
+                continue
+            when = datetime.datetime.strptime(ts, "%Y-%m-%d %H:%M:%S").astimezone()
+            model = d.get("model") or "lmstudio-unknown"
+            key = (normalize_model_name(model), u.get("prompt_tokens"), u.get("completion_tokens"))
+            if any(abs(when.timestamp() - t) <= 900 for t in logged.get(key, ())):
+                n_dup += 1
+                continue
+            details = u.get("completion_tokens_details") or {}
+            existing[rid] = {
+                "schema": SCHEMA_VERSION, "src_id": rid,
+                "ts": when.isoformat(timespec="seconds"),
+                "provider": "lmstudio", "machine": machine_name(), "user": whoami(),
+                "project": "lmstudio-server", "model": model,
+                "prompt_tokens": u.get("prompt_tokens"),
+                "completion_tokens": u.get("completion_tokens"),
+                "reasoning_tokens": details.get("reasoning_tokens"),
+                "task_tag": LMSTUDIO_TAG}
+            n_new += 1
+    with _write_lock:
+        ledger_dir().mkdir(parents=True, exist_ok=True)
+        with open(out, "w") as fh:
+            for e in existing.values():
+                fh.write(json.dumps(e) + "\n")
+    print(f"ingest lmstudio: {n_new} new requests, {n_dup} skipped (already logged by "
+          f"your code), {len(existing)} total -> {out}")
+    if n_err:
+        _ingest_error("lmstudio", n_err, first_err)
 
 
 def ingest_codex():
@@ -543,8 +947,50 @@ def ingest_codex():
         return
     files = list(src.rglob("*.jsonl"))
     print(f"ingest codex: found {len(files)} session file(s) but this "
-          f"importer doesn't know the Codex format yet.\nPlease email one "
-          f"redacted sample file to {INGEST_CONTACT} so it can be added.")
+          f"importer doesn't know the Codex format yet.\nTo get the format "
+          f"added, describe its shape (field names, not values) to "
+          f"{ingest_contact()}. Do not send transcript content: this ledger "
+          f"records counts, never what was said.")
+
+
+# ----------------------------------------------------------------- install
+_SHIM = """#!/bin/bash
+# ailedger launcher — written by `llm_usage_ledger.py install`. Re-run that to update.
+# Runs the newest llm-usage-ledger it can find, so plugin updates never break it.
+DEV=@@DEV@@
+for d in "$LLM_USAGE_LEDGER_HOME" "$DEV" \\
+         "$(ls -d "$HOME"/.claude/plugins/cache/*/research-skills/*/llm-usage-ledger 2>/dev/null | sort -V | tail -1)" \\
+         "$HOME/.claude/skills/llm-usage-ledger"; do
+  [ -n "$d" ] && [ -x "$d/bin/ailedger" ] && exec "$d/bin/ailedger" "$@"
+done
+echo "ailedger: llm-usage-ledger skill not found — install the research-skills plugin, then run:" >&2
+echo "  python3 <skill dir>/llm_usage_ledger.py install" >&2
+exit 1
+"""
+
+
+def install_cli(bin_dir: Path = None) -> Path:
+    """Put an `ailedger` command on PATH (default ~/.local/bin). A copy run
+    from a plugin cache is NOT pinned (versioned dirs vanish on update — the
+    launcher finds the newest one); a copy run from a git clone IS preferred,
+    so a developer's working tree wins over an older installed plugin."""
+    skill = Path(__file__).resolve().parent
+    dev = "" if "/plugins/cache/" in str(skill) else str(skill)
+    bin_dir = Path(bin_dir or Path.home() / ".local" / "bin")
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    target = bin_dir / "ailedger"
+    if target.exists() and "ailedger launcher" not in target.read_text(errors="replace")[:300]:
+        backup = target.with_name("ailedger.bak")
+        target.replace(backup)
+        print(f"moved your existing {target} to {backup}")
+    target.write_text(_SHIM.replace("@@DEV@@", json.dumps(dev)))
+    target.chmod(0o755)
+    (skill / "bin" / "ailedger").chmod(0o755)
+    on_path = str(bin_dir) in os.environ.get("PATH", "").split(os.pathsep)
+    print(f"installed {target}" + (f" (prefers this clone: {dev})" if dev else ""))
+    print("try:  ailedger -h      then:  ailedger" if on_path else
+          f"add to PATH first:  echo 'export PATH=\"{bin_dir}:$PATH\"' >> ~/.zshrc && source ~/.zshrc")
+    return target
 
 
 # ------------------------------------------------------------- html report
@@ -557,10 +1003,11 @@ _C = {"local": "#2a78d6", "cloud": "#008300", "ink": "#1c2733",
 def _all_usage_events():
     """Every event any writer dropped in the ledger dir, in chart shape."""
     return [{"ts": e["ts"], "local": is_local_event(e),
-             "sub": bool(e.get("subscription")),
+             "sub": is_subscription_event(e),
              "model": e.get("model", "?"), "project": e.get("project", "?"),
-             "machine": e.get("machine", "?"),
-             "user": e.get("user") or "?",
+             "machine": e.get("machine") or UNATTRIBUTED,
+             # a record with no user is its OWN bucket, never someone's row
+             "user": e.get("user") or UNATTRIBUTED,
              "tin": e.get("prompt_tokens") or 0,
              "tout": e.get("completion_tokens") or 0,
              "cr": e.get("cache_read_tokens") or 0,
@@ -585,11 +1032,18 @@ def _agg_rows(events, series):
     for e in events:
         key = (e["ts"][:blen], e["model"], e["project"], bool(e["local"]),
                bool(e.get("sub")), e.get("machine", "?"), e.get("user", "?"))
-        r = agg.setdefault(key, {"i": 0, "o": 0, "c": 0, "s": 0.0})
+        r = agg.setdefault(key, {"i": 0, "o": 0, "c": 0, "s": 0.0, "S": {}})
         r["i"] += e["tin"]
         r["o"] += e["tout"]
         r["c"] += 1
-        pin, pout, _src = as_of_price(e["model"], e["ts"], series)
+        pin, pout, _src = as_of_price(e["model"], e["ts"], series, local=bool(e["local"]),
+                                      pricing="same-model")
+        if e["local"]:
+            # Same tokens re-priced as each Claude tier, for the page's
+            # pricing dropdown (local rows only; no cache tokens locally).
+            for tier in FRONTIER_TIERS:
+                ti, to, _ = as_of_price(e["model"], e["ts"], series, local=True, pricing=tier)
+                r["S"][tier] = r["S"].get(tier, 0.0) + e["tin"] / 1e6 * ti + e["tout"] / 1e6 * to
         # Anthropic-style cache economics: reads at 10% of input rate,
         # 5-minute cache writes at 1.25x, 1-hour writes at 2x.
         r["s"] += (e["tin"] / 1e6 * pin + e["tout"] / 1e6 * pout
@@ -597,7 +1051,8 @@ def _agg_rows(events, series):
                    + e.get("w5", 0) / 1e6 * pin * 1.25
                    + e.get("w1", 0) / 1e6 * pin * 2.0)
     rows = [{"b": b, "m": m, "p": p, "l": l, "u": u, "M": M, "U": U,
-             "i": r["i"], "o": r["o"], "c": r["c"], "s": round(r["s"], 4)}
+             "i": r["i"], "o": r["o"], "c": r["c"], "s": round(r["s"], 4),
+             **({"S": {k: round(v, 4) for k, v in r["S"].items()}} if r["S"] else {})}
             for (b, m, p, l, u, M, U), r in agg.items()]
     rows.sort(key=lambda r: r["b"])
     return rows, ("daily" if blen == 10 else "hourly")
@@ -632,14 +1087,20 @@ table{border-collapse:collapse;font-size:.8rem}
 td{border:1px solid #e3e8ee;padding:3px 8px}
 summary{cursor:pointer;font-size:.85rem;margin-top:14px}
 .empty{color:#5b6b7b;font-size:.85rem;padding:18px 0}
+.pricetag{font-weight:600;color:#b4235a}
+.pricesel select{font:inherit;padding:2px 4px;margin-left:4px}
 #tt{position:absolute;background:#1c2733;color:#fff;padding:5px 9px;
  border-radius:6px;font-size:.75rem;pointer-events:none;display:none;
  z-index:9;line-height:1.5;white-space:nowrap;box-shadow:0 2px 8px #0004}
 </style></head><body>
-<h1>LLM usage ledger report</h1>
+<h1>LLM usage ledger report <span id="priceTag" class="pricetag"></span></h1>
 <div class="note">generated @@GENERATED@@ · ledger dir: ~/.llm_token_ledger
- (all *.jsonl writers merged) · @@SPAN@@</div>
+ (all *.jsonl usage writers merged; prices.jsonl is a price series, not usage,
+ and is excluded) · @@SPAN@@@@IDNOTE@@</div>
 <div class="filters">
+ <label class="pricesel">Price local models as
+  <select id="priceSel">@@PRICEOPTS@@</select></label>
+ &nbsp;·&nbsp;
  <span class="scope" id="clsChips"><button data-c="local">Local</button><button data-c="cloud">Cloud</button><button data-c="sub">Subscription</button></span>
  &nbsp;·&nbsp;
  <span class="scope" id="metricChips"><button data-m="usd" class="on">$</button><button data-m="tok">tokens</button></span>
@@ -657,6 +1118,10 @@ summary{cursor:pointer;font-size:.85rem;margin-top:14px}
 <div id="modelbars"></div>
 <h2>Tokens by project <span class="note">(within current filters)</span></h2>
 <div id="projbars"></div>
+<h2><span id="userWord">$</span> by person <span class="note">(within current
+ filters; <b>unattributed</b> = records whose writer recorded no user — shown
+ as its own bucket, never credited to a person)</span></h2>
+<div id="userbars"></div>
 <noscript><p class="note">Charts need JavaScript — the data table below is
  complete and static.</p></noscript>
 <details><summary>Data table (all models, unfiltered)</summary>
@@ -675,12 +1140,17 @@ catch(e){ document.getElementById("timeline").textContent =
   "report data failed to load: " + e; return; }
 var C = {local:"#2a78d6", cloud:"#008300", sub:"#e87ba4", ink:"#1c2733",
          muted:"#5b6b7b", grid:"#e3e8ee"};
+var UNATTR = "@@UNATTR@@";
 var visible = {local:true, cloud:true, sub:true};
 var machOn = null;   // null until built; map machine -> bool
 var metric = "usd", sel = null;   // sel === null -> all models
+var PRICES = @@PRICEMETA@@;
+var pricing = (location.hash.match(/price=([a-z-]+)/) || [])[1] || "@@PRICEDEFAULT@@";
+if (!PRICES[pricing]) pricing = "same-model";
+function cost(r){ return (r.l && pricing !== "same-model" && r.S) ? (r.S[pricing] || 0) : r.s; }
 var NS = "http://www.w3.org/2000/svg";
 function cls(r){ return r.u ? "sub" : (r.l ? "local" : "cloud"); }
-function val(r){ return metric === "usd" ? r.s : r.i + r.o; }
+function val(r){ return metric === "usd" ? cost(r) : r.i + r.o; }
 
 function fmt(n){ n = Math.round(n);
   return n >= 1e9 ? (n/1e9).toFixed(2)+"B" : n >= 1e6 ? (n/1e6).toFixed(1)+"M"
@@ -729,11 +1199,12 @@ function modelTotals(rs){
 function tiles(rs){
   var calls=0, tin=0, tout=0, saved=0, spend=0, subv=0;
   rs.forEach(function(r){ calls += r.c; tin += r.i; tout += r.o;
-    if (r.u) subv += r.s; else if (r.l) saved += r.s; else spend += r.s; });
+    var v = cost(r);
+    if (r.u) subv += v; else if (r.l) saved += v; else spend += v; });
   var t = div("tiles");
   [["calls", calls.toLocaleString()],
    ["tokens in / out", fmt(tin) + " / " + fmt(tout)],
-   ["local cost avoided*", "$" + saved.toFixed(2)],
+   ["local cost avoided* (" + PRICES[pricing].short + ")", "$" + saved.toFixed(2)],
    ["cloud est. spend*", "$" + spend.toFixed(2)],
    ["subscription @ API rates*", "$" + subv.toFixed(2)],
    ["models shown", String(modelTotals(rs).length)]
@@ -875,7 +1346,18 @@ function render(){
   rs.forEach(function(r){ pt[r.p] = (pt[r.p] || 0) + val(r); });
   bars("projbars", Object.keys(pt).map(function(p){
       return {m:p, v:pt[p]}; }).sort(function(a,b){ return b.v-a.v; }),
-    function(){ return C.ink; }); }
+    function(){ return C.ink; });
+  // Per-person bucket. A row whose writer left `user` empty is bucketed as
+  // UNATTR and drawn in grey -- it is NOT folded into whoever opened this
+  // report, which is what the old reader-identity default did to 22k rows.
+  document.getElementById("userWord").textContent =
+    metric === "usd" ? "$" : "Tokens";
+  var ut = {};
+  rs.forEach(function(r){ var u = r.U || UNATTR;
+    ut[u] = (ut[u] || 0) + val(r); });
+  bars("userbars", Object.keys(ut).map(function(u){
+      return {m:u, v:ut[u]}; }).sort(function(a,b){ return b.v-a.v; }),
+    function(p){ return p.m === UNATTR ? C.muted : C.ink; }); }
 
 document.getElementById("gran").textContent = D.granularity;
 (function(){
@@ -930,6 +1412,15 @@ document.querySelectorAll("#metricChips button").forEach(function(b){
   b.addEventListener("click", function(){
     metric = b.getAttribute("data-m") === "usd" ? "usd" : "tok";
     render(); }); });
+function applyPricing(){
+  var p = PRICES[pricing];
+  document.getElementById("priceTag").textContent = "(" + p.title + ")";
+  document.title = "LLM usage ledger — " + p.short;
+  document.getElementById("priceSel").value = pricing;
+  try { history.replaceState(null, "", "#price=" + pricing); } catch(e) {} }
+document.getElementById("priceSel").addEventListener("change", function(e){
+  pricing = e.target.value; applyPricing(); render(); });
+applyPricing();
 render();
 })();
 </script>
@@ -942,8 +1433,10 @@ def html_report(path, days=None, only_user=None):
     own usage, not an unrequested league table of everyone's spend. Pass
     only_user=None explicitly (CLI: --all) for the org-wide roll-up."""
     events = _all_usage_events()
+    n_unattributed = sum(1 for e in events if e["user"] == UNATTRIBUTED)
     if only_user:
-        events = [e for e in events if (e.get("user") or "?") == only_user]
+        events = [e for e in events
+                  if (e.get("user") or UNATTRIBUTED) == only_user]
     if days:
         cutoff = (datetime.datetime.now().astimezone()
                   - datetime.timedelta(days=days)).isoformat()
@@ -954,9 +1447,11 @@ def html_report(path, days=None, only_user=None):
     rows, granularity = _agg_rows(events, series)
 
     priced = {normalize_model_name(e["model"]) for e in events if e["local"]
-              and as_of_price(e["model"], e["ts"], series)[2] == "model"}
-    price_note = (f"per-model hosted rates for {len(priced)} local model(s), "
-                  "reference benchmark for the rest" if priced else
+              and as_of_price(e["model"], e["ts"], series, local=True)[2] == "model"}
+    price_note = (f"default view: per-model hosted rates for {len(priced)} local model(s), "
+                  "open-model median (reference-open) for unpriced local models; the "
+                  "'Price local models as' menu re-prices local rows as a Claude tier "
+                  "(shown in the title)" if priced else
                   "reference benchmark only — run `prices update` "
                   "for per-model hosted rates")
 
@@ -974,14 +1469,43 @@ def html_report(path, days=None, only_user=None):
         for m, r in sorted(by_model.items(), key=lambda kv: -(kv[1]["i"]
                                                               + kv[1]["o"])))
 
+    # Say out loud what happened to identity-less rows. Silently dropping them
+    # (when filtered to one person) or silently absorbing them (what the old
+    # reader-identity default did) both produce a total nobody can check.
+    if n_unattributed and only_user and only_user != UNATTRIBUTED:
+        id_note = (f" · {n_unattributed:,} event(s) carry no user field and are "
+                   f"EXCLUDED from this single-person view — they are not "
+                   f"yours to claim; use --all or --user {UNATTRIBUTED}")
+    elif n_unattributed:
+        id_note = (f" · {n_unattributed:,} event(s) carry no user field and are "
+                   f"bucketed as '{UNATTRIBUTED}'")
+    else:
+        id_note = ""
+
     data_json = json.dumps({"rows": rows, "granularity": granularity}
+                           ).replace("</", "<\\/")
+    meta = {"same-model": {"title": "local models priced at same-model cloud rental — most realistic",
+                           "short": "same-model rental",
+                           "label": "Same model rented in the cloud (most realistic)"}}
+    for tier in FRONTIER_TIERS:
+        src = frontier_source(tier)
+        meta[tier] = {"title": f"local models priced at Claude {tier.capitalize()} replacement cost — {src}",
+                      "short": f"as Claude {tier.capitalize()}",
+                      "label": f"Claude {tier.capitalize()} replacement — {src}"}
+    opts = "".join(f'<option value="{k}">{escape_html(v["label"])}</option>' for k, v in meta.items())
+    meta_json = json.dumps({k: {"title": v["title"], "short": v["short"]} for k, v in meta.items()}
                            ).replace("</", "<\\/")
     html = (_HTML_TEMPLATE
             .replace("@@GENERATED@@", datetime.datetime.now().astimezone()
                      .isoformat(timespec="minutes"))
             .replace("@@SPAN@@", ("last %g days" % days) if days else "all time")
+            .replace("@@IDNOTE@@", escape_html(id_note))
+            .replace("@@UNATTR@@", UNATTRIBUTED)
             .replace("@@TABLE@@", table)
             .replace("@@PRICENOTE@@", escape_html(price_note))
+            .replace("@@PRICEOPTS@@", opts)
+            .replace("@@PRICEMETA@@", meta_json)
+            .replace("@@PRICEDEFAULT@@", LOCAL_PRICING if LOCAL_PRICING in meta else "same-model")
             .replace("@@DATA@@", data_json))
     Path(path).write_text(html)
     n_local = sum(1 for e in events if e["local"])
@@ -1000,7 +1524,11 @@ def main(argv=None):
     sub = ap.add_subparsers(dest="cmd", required=True)
     p = sub.add_parser("report")
     p.add_argument("--by", default="project-model",
-                   choices=["project", "model", "user", "project-model"])
+                   choices=["project", "repo", "model", "user", "machine",
+                            "project-model"],
+                   help="repo = the cross-developer join key (canonical git "
+                        "remote); project = the local folder name, which "
+                        "differs between developers")
     p.add_argument("--windows", action="store_true")
     p.add_argument("--days", type=float)
     p.add_argument("--all", action="store_true",
@@ -1009,6 +1537,12 @@ def main(argv=None):
     p.add_argument("--user", help="restrict to one user (default: you)")
     p.add_argument("--open", action="store_true",
                    help="open the generated --html dashboard in the browser")
+    p.add_argument("--local-as", choices=["same-model", "frontier", *FRONTIER_TIERS],
+                   default="same-model",
+                   help="price local-model rows as the SAME open model rented in the cloud "
+                        "(default), or as a Claude tier haiku|sonnet|opus|fable (newest model of "
+                        "that family in the live price table; 'frontier' = sonnet). "
+                        "With --html this just preselects the page's pricing menu.")
     p.add_argument("--html", nargs="?", const="__DEFAULT__",
                    metavar="PATH", help="write a self-contained graphical "
                    "HTML report (charts over the whole ledger dir) to PATH")
@@ -1016,14 +1550,25 @@ def main(argv=None):
     p.add_argument("action", choices=["update", "list"],
                    help="update: fetch hosted rates for ledger models and "
                         "append dated entries; list: show the series")
+    p = sub.add_parser("install", help="put the `ailedger` command on your PATH (~/.local/bin)")
+    p.add_argument("--bin-dir", help="install somewhere other than ~/.local/bin")
     p = sub.add_parser("ingest", help="import subscription-tool usage "
                        "(flat-fee plans) into the ledger as derived events")
-    p.add_argument("tool", choices=["claude-code", "codex"])
+    p.add_argument("tool", choices=["claude-code", "codex", "lmstudio", "all"])
+    p.add_argument("--refresh", action="store_true",
+                   help="OPT-IN MIGRATION: re-derive rows already in the "
+                        "ledger so fields added to the importer later (e.g. "
+                        "`repo`, the cross-developer join key) reach records "
+                        "imported before they existed. Rewrites existing "
+                        "rows; the default never does.")
     a = ap.parse_args(argv)
 
     if a.cmd == "report":
+        global LOCAL_PRICING
+        LOCAL_PRICING = (DEFAULT_FRONTIER_TIER if a.local_as == "frontier"
+                         else a.local_as)
         if a.html == "__DEFAULT__":
-            a.html = str(default_report_path())
+            a.html = str(default_report_path())  # one page; --local-as only preselects the menu
         if a.html:
             # Shared dir => default to just you. Local dir is already just you,
             # so the flag is a no-op there and nobody has to think about it.
@@ -1059,8 +1604,16 @@ def main(argv=None):
                 for ts, pin, pout in rows:
                     print(f"{ts} {model:32s} in=${pin:<8g} out=${pout:g}")
         return 0
+    if a.cmd == "install":
+        install_cli(a.bin_dir)
+        return 0
     if a.cmd == "ingest":
-        (ingest_claude_code if a.tool == "claude-code" else ingest_codex)()
+        if a.tool in ("claude-code", "all"):
+            ingest_claude_code(refresh=a.refresh)
+        if a.tool in ("lmstudio", "all"):
+            ingest_lmstudio()
+        if a.tool == "codex":
+            ingest_codex()
         return 0
     return 1
 

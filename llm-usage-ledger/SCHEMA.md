@@ -37,10 +37,26 @@ when each one arrived.
 | `prompt_tokens` / `completion_tokens` | v1 | The skill's own writer. **Both schemas coexist** and the reader normalises them — do not "fix" one into the other; historical rows would change meaning. |
 | `reasoning_tokens` | v1 | `null` when the model does not report it. **Never write 0 for "unknown"** — the distinction matters for thinking models. |
 | `duration_s` | v1 | Wall time. Absent on ingested subscription rows (transcripts carry no per-call timing). |
-| `machine`, `user` | v1 | Also encoded in the filename. |
+| `machine`, `user` | v1 | Also encoded in the filename. **Absent on every `ledger.jsonl` row** (22,244 measured 2026-08-21). Readers surface absence as the literal string `unattributed`; until 2026-08-21 they substituted the *reader's* identity, silently crediting one person with every foreign writer's spend. Absence is a fact — never fill it in. |
+| `repo` | v1 (written by `log_usage()`); **ingest since 1.1.0** | Canonical git remote, `host/org/name` — the cross-developer join key. `git@github.com:Org/Repo.git` and `https://github.com/org/repo` both canonicalise to `github.com/org/repo`; raw URLs split the join. No remote → `no-remote:<12 hex of sha256(abspath)>`, an explicit unjoinable marker, never a path. **Empty on all 46,683 rows written before 1.1.0**; `ingest claude-code --refresh` backfills the subscription rows from the transcripts, opt-in. |
+| `d1` | v1 (written by `log_usage()`); **ingest since 1.1.0** | Institutional code from `~/.agent-coach/projects.json`, looked up by canonical repo key with a fallback to the raw-URL keys agent-coach already wrote. Absent for POCs and untagged repos — never invented. |
 | `task_tag` | v1 | Optional caller-supplied label. |
 | `subscription` | v1 | `true` for flat-fee sources (Claude Code); such rows have no marginal cost and must not be priced per-token. |
 | `schema` | v1 | Integer version marker. |
+
+## Files in the ledger directory that are NOT events
+
+`read_ledgers(scope="all")` globs `*.jsonl`. Two things live there that are not
+usage and are excluded **by name** (`NON_USAGE_FILES`), not by sniffing fields:
+
+| File | What it is |
+|---|---|
+| `prices.jsonl` | the dated price series. Its rows parse, carry a `ts`, and were counted as 86 zero-token calls until 2026-08-21. |
+
+One known residue, recorded rather than silently handled: `ledger.jsonl` line 1
+is `{"type":"scrub_tombstone", …}`, a record of a deletion. It has no tokens and
+still counts as one call. Excluding it would mean matching on a *record* field,
+which is the heuristic this section exists to avoid; it is 1 row in 46,683.
 
 ## Deliberately NOT done (revisit dates)
 

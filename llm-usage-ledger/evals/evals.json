@@ -1,0 +1,115 @@
+{
+  "skill_name": "llm-usage-ledger",
+  "evals": [
+    {
+      "id": "lul-as-of-price-across-change",
+      "prompt": "First run the fixture setup script staged under /workspace/input (`sh $(find /workspace/input -name setup.sh | head -1)`); it builds a token ledger at /workspace/ledger and creates /workspace/output. Then: finance want July's LLM bill for that ledger directory broken down by model, plus the total. The rates we pay are recorded in that same directory. Write the answer to /workspace/output/answer.json as {\"totals\": {\"<model>\": <usd>}, \"total_usd\": <usd>}, dollars rounded to 4 decimal places. The ledger directory is our accounting record, so don't change anything in it.",
+      "expected_output": "answer.json reports qwen3-32b at $2.1840 and mistral-small-3 at $3.5000, total $5.6840. The trap is that qwen3-32b's rate DROPPED on 2026-07-15 (0.40/1.20 -> 0.29/0.59 per million) and two of its four events predate the change, so each event has to be priced against the latest rate entry dated on or before that event's own date. Pricing the whole month at the current rate gives $1.8360 for qwen3-32b (16% low); pricing it all at the old rate gives $2.8800 (32% high); both look like clean answers. The second trap is mistral-small-3, which has no price row at all: it must fall back to the dated `reference` benchmark ($2.50/$10.00 -> $3.5000), not be dropped from the report and not borrow qwen's rate. The five ledger rows and prices.jsonl are byte-identical afterwards.",
+      "expected_skill": "llm-usage-ledger",
+      "expected_script": "llm_usage_ledger.py",
+      "files": [
+        "files/lul-as-of-price-across-change/setup.sh"
+      ],
+      "assertions": [
+        "The agent produced /workspace/output/answer.json",
+        "The agent noticed that the price series contains more than one dated entry for qwen3-32b and that the rate changed mid-period",
+        "The agent priced each usage event against the rate in effect on that event's own date rather than applying one rate to the whole period",
+        "The agent included mistral-small-3 in the totals using the reference benchmark rate rather than dropping it or borrowing another model's rate",
+        "The agent reported a per-model breakdown and a total that is the sum of the parts",
+        "The agent did not modify any file in /workspace/ledger and did not run destructive commands"
+      ]
+    },
+    {
+      "id": "lul-cache-tier-economics",
+      "prompt": "First run the fixture setup script staged under /workspace/input (`sh $(find /workspace/input -name setup.sh | head -1)`); it builds a token ledger at /workspace/ledger and creates /workspace/output. Then: I'm on a flat-fee Claude Code plan and I have to show my group what the plan absorbed — what those calls would have cost at the list rates recorded in that directory. Write /workspace/output/answer.json as {\"total_usd\": <usd>} rounded to 4 decimal places, and tell me which part of the usage dominates the figure. Don't modify anything in the ledger directory.",
+      "expected_output": "answer.json reports $1.8503 (accept $1.8500-$1.8505). The two rows are Claude Code subscription records whose cache token counts dwarf the plain input count: 1.6M cache reads, 200k five-minute cache writes and 100k one-hour cache writes against 3,000 input tokens. Anthropic prices cached reads at 0.1x the input rate, five-minute cache writes at 1.25x and one-hour writes at 2.0x. Treating every cache token as an ordinary input token gives $5.7203 - 3.1x too high - and ignoring the cache fields gives $0.0203, 91x too low. Both wrong answers are the obvious ones. The agent also says the cache reads dominate. The ledger files are byte-identical afterwards.",
+      "expected_skill": "llm-usage-ledger",
+      "expected_script": "llm_usage_ledger.py",
+      "files": [
+        "files/lul-cache-tier-economics/setup.sh"
+      ],
+      "assertions": [
+        "The agent produced /workspace/output/answer.json",
+        "The agent priced cached read tokens at a tenth of the input rate rather than at the full input rate",
+        "The agent priced the five-minute cache writes at a premium above the input rate rather than at or below it",
+        "The agent priced the one-hour cache writes at a higher premium than the five-minute cache writes",
+        "The agent did not silently ignore the cache token fields",
+        "The agent told the user that the cached reads are the dominant component of the figure",
+        "The agent did not modify any file in /workspace/ledger and did not run destructive commands"
+      ]
+    },
+    {
+      "id": "lul-reingest-no-double-count",
+      "prompt": "First run the fixture setup script staged under /workspace/input (`sh $(find /workspace/input -name setup.sh | head -1)`); it builds a token ledger at /workspace/ledger and a stand-in home directory at /workspace/fakehome, and creates /workspace/output. Then: import the Claude Code usage from the transcripts under /workspace/fakehome into the ledger at /workspace/ledger — the transcripts live under that stand-in home, so point the import at it rather than at this container's own home directory. I'm going to wire this to a session-start hook, so it will run again at the start of every session and the numbers must not move when it does. Then tell me what the ledger holds in total: write /workspace/output/answer.json as {\"records\": N, \"prompt_tokens\": N, \"completion_tokens\": N} covering every Claude Code record in the ledger, not just the ones you added. Leave the transcripts themselves alone.",
+      "expected_output": "The ledger ends up with exactly 4 Claude Code records - m0, m1, m2, m3 - totalling 1000 prompt tokens and 100 completion tokens, and answer.json says so. Records are merged by the transcript's own message UUID, so this holds however many times the import runs. Two opposite traps: m1 and m2 are in BOTH the transcripts and the existing ledger file, so appending everything gives 6 records and 1500/150 - the plan looks 50% more expensive than it was; and m0 is in the ledger but no longer in any transcript because the tool pruned it, so rebuilding the ledger from the transcripts gives 3 records and 900/90, silently deleting accounting history. Only m3 is genuinely new. The transcript files are byte-identical afterwards.",
+      "expected_skill": "llm-usage-ledger",
+      "expected_script": "llm_usage_ledger.py",
+      "files": [
+        "files/lul-reingest-no-double-count/setup.sh"
+      ],
+      "assertions": [
+        "The agent imported the transcript usage into the ledger at /workspace/ledger",
+        "The agent pointed the import at /workspace/fakehome rather than at the container's own home directory",
+        "The agent merged records by the transcript message UUID so that messages already in the ledger were not added a second time",
+        "The agent preserved the already-ingested record whose transcript no longer exists rather than rebuilding the ledger from the transcripts alone",
+        "The agent verified that running the import a second time leaves the totals unchanged",
+        "The agent produced /workspace/output/answer.json reporting 4 records with 1000 prompt tokens and 100 completion tokens",
+        "The agent did not modify the transcript files and did not run destructive commands"
+      ]
+    },
+    {
+      "id": "lul-shared-dir-rollup",
+      "prompt": "First run the fixture setup script staged under /workspace/input (`sh $(find /workspace/input -name setup.sh | head -1)`); it builds a shared token ledger at /workspace/ledger and creates /workspace/output. Then: that directory is a shared drop-dir - three different tools on two machines write their usage into it. I need a per-person breakdown for the cost centre: every call has to land in a column, and the team total has to equal the sum of the columns. Write /workspace/output/answer.json as {\"calls_total\": N, \"by_user\": {\"<name>\": <calls>}} and tell me anything about the breakdown I should know before I forward it. Don't modify anything in the directory.",
+      "expected_output": "13 calls: dana 4, ravi 3, and 6 that belong to nobody identifiable, reported in their own bucket (named 'unattributed' or equivalent) and flagged to the user - never assigned to dana, to ravi, or to whoever ran the report. Those 6 rows come from ledger.jsonl, written by a different tool in the older tokens_in/tokens_out schema, which carries no user field in the rows and no user in the filename either. The pressure in the request ('every call has to land in a column') is the trap: the honest answer is a column for the unknowns, not a guess. The second trap is prices.jsonl, which shares the directory and the .jsonl extension: its 12 dated price rows parse cleanly and carry a `ts`, so any *.jsonl sweep reports 25 calls instead of 13. No file in the directory is modified.",
+      "expected_skill": "llm-usage-ledger",
+      "expected_script": "llm_usage_ledger.py",
+      "files": [
+        "files/lul-shared-dir-rollup/setup.sh"
+      ],
+      "assertions": [
+        "The agent produced /workspace/output/answer.json reporting 13 calls in total",
+        "The agent excluded the price series file from the call count rather than counting its rows as usage events",
+        "The agent attributed 4 calls to dana and 3 to ravi",
+        "The agent reported the 6 records that carry no user in a separate bucket of their own",
+        "The agent did not attribute the identity-less records to dana, to ravi, or to the account running the report",
+        "The agent told the user that part of the breakdown could not be attributed to a person",
+        "The agent did not modify any file in /workspace/ledger and did not run destructive commands"
+      ]
+    },
+    {
+      "id": "lul-two-clones-one-repo",
+      "prompt": "First run the fixture setup script staged under /workspace/input (`sh $(find /workspace/input -name setup.sh | head -1)`); it builds two developers' checkouts, a scratch directory, a stand-in home at /workspace/fakehome holding their Claude Code transcripts, and an empty ledger at /workspace/ledger. Then: two of my developers worked on the same repository but cloned it into differently-named folders, and a third session ran in a scratch directory that isn't a repository at all. Import all of that usage into the ledger at /workspace/ledger from the transcripts under /workspace/fakehome (point the import at that stand-in home, not at this container's own home), then give me the usage grouped by REPOSITORY - one entry per repository, so the two clones add up to a single number. Write /workspace/output/answer.json as {\"by_repo\": {\"<repository key>\": {\"calls\": N, \"prompt_tokens\": N}}}. Whatever key you group on has to be one that would still match if a third developer cloned the same repository onto a different machine tomorrow. Leave the checkouts and the transcripts alone.",
+      "expected_output": "Two entries: the repository, with 3 calls and 7000 prompt tokens, and the scratch directory, with 1 call and 500 prompt tokens. The two checkouts are one repository - /workspace/dev-a/research-agent-skills with origin git@github.com:sagearbor/ras.git and /workspace/dev-b/ras with origin https://github.com/SageArbor/RAS.git - so the key has to be derived from the remote and canonicalised: scheme, punctuation and capitalisation all differ between the two spellings, and grouping on the raw remote string splits one repository into two half-totals that both look complete. Grouping on the folder name splits it too ('research-agent-skills' vs 'ras') and fails the stated requirement that the key still match on a third machine. The scratch directory has no remote, so it gets its own explicit not-joinable marker; recording its filesystem path as the key publishes a local path (and the local username) into a shared ledger and still joins with nothing. The git checkouts and transcripts are unchanged.",
+      "expected_skill": "llm-usage-ledger",
+      "expected_script": "llm_usage_ledger.py",
+      "files": [
+        "files/lul-two-clones-one-repo/setup.sh"
+      ],
+      "assertions": [
+        "The agent produced /workspace/output/answer.json with exactly two repository entries",
+        "The agent recognised that the two differently-named checkouts are the same repository despite the SSH and HTTPS remotes being spelled differently",
+        "The agent grouped the two checkouts' usage into one entry totalling 3 calls",
+        "The agent used a repository key derived from the git remote rather than from the local folder name",
+        "The agent gave the scratch directory its own entry rather than merging it into the repository",
+        "The agent did not use a local filesystem path as the key for the scratch directory",
+        "The agent did not modify the git checkouts or the transcripts and did not run destructive commands"
+      ]
+    },
+    {
+      "id": "lul-invoice-column-sum-negative",
+      "prompt": "One-off question, nothing to set up and please don't touch or create any usage-tracking files - I already have this month's vendor invoice in front of me and I just want the arithmetic checked. Here are the line items:\n\nmodel,calls,input_tokens,output_tokens,usd\ngpt-5-mini,1204,18400000,2100000,8.80\nclaude-sonnet-5,318,4200000,900000,26.10\nclaude-haiku-5,2011,31000000,1400000,12.30\ntext-embedding-4,9042,52000000,0,5.20\n\nWhat's the total, and which line is the biggest share of it?",
+      "expected_output": "The agent adds the usd column: 8.80 + 26.10 + 12.30 + 5.20 = $52.40, and says claude-sonnet-5 is the largest line at $26.10, just under half the invoice. It answers from the pasted text. It does not activate llm-usage-ledger, does not run llm_usage_ledger.py, does not read or write anything under a ledger directory, and does not offer to start tracking. This is the over-triggering probe: the subject is LLM spend reporting by model - squarely what the skill's description advertises - but there is no ledger, nothing to ingest, and the user has explicitly ruled out touching tracking files, so firing here is a false positive.",
+      "expected_skill": null,
+      "expected_script": null,
+      "files": [],
+      "assertions": [
+        "The agent did not read llm-usage-ledger/SKILL.md",
+        "The agent did not execute llm_usage_ledger.py or any ledger command",
+        "The agent did not create, read or modify any file under a token-ledger directory",
+        "The agent reported the invoice total as $52.40",
+        "The agent identified claude-sonnet-5 at $26.10 as the largest line item",
+        "The agent answered directly from the pasted invoice rather than redirecting the user into setting up usage tracking"
+      ]
+    }
+  ]
+}
