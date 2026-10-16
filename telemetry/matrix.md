@@ -14,8 +14,11 @@ Auto-rendered from `telemetry/*.jsonl` (append-only run ledgers; each skill's `r
 | agent-coach | 1.1.0 | claude-opus-5 | 10 | 100% | 0.30±0.11s | 2026-08-04 |
 | azure-credential-guard | 0.1.0 | claude-opus-5 | 1 | 100% | 0.51±0.00s | 2026-08-09 |
 | codex-security-scan | 0.1.0 | claude-opus-5 | 2 | 100% | 0.02±0.00s | 2026-07-29 |
-| llm-usage-ledger | 1.0.0 | claude-opus-5 | 5 | 100% | 0.24±0.07s | 2026-08-04 |
+| llm-usage-ledger-transport | 1.1.0 | claude-sonnet-5 | 1 | 100% | 0.52±0.00s | 2026-08-25 |
+| llm-usage-ledger | 1.0.0 | claude-opus-5 | 6 | 100% | 0.26±0.08s | 2026-08-21 |
 | llm-usage-ledger | 1.0.0 | merge-check | 1 | 100% | 0.21±0.00s | 2026-07-28 |
+| llm-usage-ledger | 1.1.0 | claude-opus-5 | 1 | 100% | 0.59±0.00s | 2026-08-21 |
+| llm-usage-ledger | 1.1.0 | claude-sonnet-5 | 1 | 100% | 0.55±0.00s | 2026-08-24 |
 | lmstudio-panel | 0.1.0 | claude-fable-5 | 1 | 100% | 0.15±0.00s | 2026-07-27 |
 | lmstudio-panel | 0.2.0 | claude-fable-5 | 1 | 100% | 0.24±0.00s | 2026-07-27 |
 | lmstudio-panel | 0.3.0 | claude-fable-5 | 1 | 100% | 0.19±0.00s | 2026-07-27 |
