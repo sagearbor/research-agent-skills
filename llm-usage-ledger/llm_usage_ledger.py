@@ -572,6 +572,13 @@ def load_price_series() -> dict:
     return dict(series)
 
 
+# How local rows are priced: "same-model" (default — renting the same open
+# model in the cloud) or "frontier" (the counterfactual "had I used a frontier
+# cloud model instead": every local row at the dated `reference` benchmark).
+# Set by `report --local-as`.
+LOCAL_PRICING = "same-model"
+
+
 def as_of_price(model: str, ts: str, series: dict, local: bool = False):
     """Price for one event. Returns (in_per_m, out_per_m, source).
 
@@ -583,7 +590,9 @@ def as_of_price(model: str, ts: str, series: dict, local: bool = False):
     """
     day = (ts or "")[:10]
     keys = [(normalize_model_name(model), "model")]
-    if local:
+    if local and LOCAL_PRICING == "frontier":
+        keys = []
+    elif local:
         keys.append(("reference-open", "reference-open"))
     keys.append(("reference", "reference"))
     for key, src in keys:
@@ -1210,10 +1219,16 @@ def html_report(path, days=None, only_user=None):
 
     priced = {normalize_model_name(e["model"]) for e in events if e["local"]
               and as_of_price(e["model"], e["ts"], series, local=True)[2] == "model"}
-    price_note = (f"per-model hosted rates for {len(priced)} local model(s), "
-                  "open-model median (reference-open) for unpriced local models" if priced else
-                  "reference benchmark only — run `prices update` "
-                  "for per-model hosted rates")
+    if LOCAL_PRICING == "frontier":
+        r = CLOUD_REFERENCE_RATES[CURRENT_RATE_KEY]
+        price_note = (f"LOCAL ROWS PRICED AS A FRONTIER CLOUD MODEL (${r['input_per_m']:g}/M in, "
+                      f"${r['output_per_m']:g}/M out) — the 'had I used a frontier model instead' "
+                      "counterfactual; default view prices them as the same open model rented")
+    else:
+      price_note = (f"per-model hosted rates for {len(priced)} local model(s), "
+                    "open-model median (reference-open) for unpriced local models" if priced else
+                    "reference benchmark only — run `prices update` "
+                    "for per-model hosted rates")
 
     # Static, JS-independent fallback table over ALL models.
     by_model = {}
@@ -1283,6 +1298,10 @@ def main(argv=None):
     p.add_argument("--user", help="restrict to one user (default: you)")
     p.add_argument("--open", action="store_true",
                    help="open the generated --html dashboard in the browser")
+    p.add_argument("--local-as", choices=["same-model", "frontier"], default="same-model",
+                   help="price local-model rows as the SAME open model rented in the cloud "
+                        "(default), or as a FRONTIER cloud model (counterfactual: 'had I used "
+                        "a frontier model instead'); frontier HTML defaults to llm-spend-frontier.html")
     p.add_argument("--html", nargs="?", const="__DEFAULT__",
                    metavar="PATH", help="write a self-contained graphical "
                    "HTML report (charts over the whole ledger dir) to PATH")
@@ -1302,8 +1321,11 @@ def main(argv=None):
     a = ap.parse_args(argv)
 
     if a.cmd == "report":
+        global LOCAL_PRICING
+        LOCAL_PRICING = a.local_as
         if a.html == "__DEFAULT__":
-            a.html = str(default_report_path())
+            a.html = str(default_report_path() if a.local_as == "same-model"
+                         else reports_dir() / "llm-spend-frontier.html")
         if a.html:
             # Shared dir => default to just you. Local dir is already just you,
             # so the flag is a no-op there and nobody has to think about it.

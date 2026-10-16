@@ -221,6 +221,10 @@ def run_suite():
             '{"ts":"2026-07-20","model":"qwen3-32b","input_per_m":0.29,"output_per_m":0.59,"source":"t"}\n'
             '{"ts":"2026-07-01","model":"reference","input_per_m":2.5,"output_per_m":10.0,"source":"t"}\n')
 
+        lp.LOCAL_PRICING = "frontier"
+        fr = lp.as_of_price("qwen3-32b", "2026-07-26T12:00:00", s, local=True)
+        lp.LOCAL_PRICING = "same-model"
+        check("local_as_frontier", fr[2] == "reference" and fr[0] == 2.5, f"got {fr}")
         check("pipeline_plan_calls_are_subscription",
               lp.is_subscription_event({"provider": "claude-cli", "endpoint_host": "subscription"})
               and lp.is_subscription_event({"provider": "codex-cli"})
