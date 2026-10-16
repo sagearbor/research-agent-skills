@@ -283,6 +283,20 @@ def _normalize(e: dict) -> dict:
     return {**e, **fill} if fill else e
 
 
+# Flat-fee plan usage. `ingest` rows carry subscription=true; pipelines that
+# shell out to `claude -p` / `codex exec` mark it with endpoint_host
+# "subscription" instead (llm-as-judge token_ledger). Both are plan usage —
+# booking the second as cloud showed $651 of phantom "cloud spend" on
+# 2026-10-14 that was really the Max and ChatGPT plans (2026-10-16).
+SUBSCRIPTION_PROVIDERS = frozenset({"claude-cli", "codex-cli", "claude-code", "codex"})
+
+
+def is_subscription_event(e: dict) -> bool:
+    return bool(e.get("subscription")
+                or e.get("endpoint_host") == "subscription"
+                or e.get("provider") in SUBSCRIPTION_PROVIDERS)
+
+
 def is_local_event(e: dict) -> bool:
     return e.get("provider") in ("lmstudio", "local", "ollama", "mlx")
 
@@ -778,7 +792,7 @@ _C = {"local": "#2a78d6", "cloud": "#008300", "ink": "#1c2733",
 def _all_usage_events():
     """Every event any writer dropped in the ledger dir, in chart shape."""
     return [{"ts": e["ts"], "local": is_local_event(e),
-             "sub": bool(e.get("subscription")),
+             "sub": is_subscription_event(e),
              "model": e.get("model", "?"), "project": e.get("project", "?"),
              "machine": e.get("machine") or UNATTRIBUTED,
              # a record with no user is its OWN bucket, never someone's row

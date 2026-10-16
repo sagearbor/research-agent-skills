@@ -221,6 +221,12 @@ def run_suite():
             '{"ts":"2026-07-20","model":"qwen3-32b","input_per_m":0.29,"output_per_m":0.59,"source":"t"}\n'
             '{"ts":"2026-07-01","model":"reference","input_per_m":2.5,"output_per_m":10.0,"source":"t"}\n')
 
+        check("pipeline_plan_calls_are_subscription",
+              lp.is_subscription_event({"provider": "claude-cli", "endpoint_host": "subscription"})
+              and lp.is_subscription_event({"provider": "codex-cli"})
+              and not lp.is_subscription_event({"provider": "azure", "endpoint_host": "x.openai.azure.com"}),
+              "claude-cli/codex-cli plan usage booked as cloud spend")
+
         # 8d. D2 — prices.jsonl lives in the ledger dir but is a PRICE series,
         # not usage. The scope="all" glob swept it in and counted every dated
         # price row (86 live) as a zero-token call, inflating the calls tile.
